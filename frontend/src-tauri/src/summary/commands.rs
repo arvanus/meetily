@@ -46,6 +46,15 @@ pub async fn api_save_meeting_summary<R: Runtime>(
     match SummaryProcessesRepository::update_meeting_summary(pool, &meeting_id, &summary).await {
         Ok(true) => {
             log_info!("Summary saved successfully for meeting_id: {}", meeting_id);
+
+            // Export summary.md to recording folder (best-effort, non-blocking)
+            let pool_clone = pool.clone();
+            let mid = meeting_id.clone();
+            let summary_clone = summary.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::summary::file_export::save_summary_to_folder(&pool_clone, &mid, &summary_clone).await;
+            });
+
             Ok(serde_json::json!({
                 "message": "Meeting summary saved successfully"
             }))
