@@ -319,6 +319,12 @@ impl SummaryService {
                         "Summary saved successfully for meeting_id: {}",
                         meeting_id
                     );
+
+                    // Export summary.md to recording folder
+                    let result_for_export = serde_json::json!({ "markdown": final_markdown });
+                    crate::summary::file_export::save_summary_to_folder(
+                        &pool, &meeting_id, &result_for_export,
+                    ).await;
                 }
             }
             Err(e) => {

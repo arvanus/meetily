@@ -31,6 +31,7 @@ pub struct CustomOpenAIConfig {
 }
 
 pub mod commands;
+pub mod file_export;
 pub mod llm_client;
 pub mod processor;
 pub mod service;
