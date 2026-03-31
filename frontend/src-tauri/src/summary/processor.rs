@@ -172,6 +172,7 @@ pub async fn generate_meeting_summary(
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
+    meeting_date: Option<&str>,
 ) -> Result<(String, i64), String> {
     // Check cancellation at the start
     if let Some(token) = cancellation_token {
@@ -334,14 +335,22 @@ pub async fn generate_meeting_summary(
         section_instructions, clean_template_markdown
     );
 
-    let mut final_user_prompt = format!(
-        r#"
-<transcript_chunks>
+    let mut final_user_prompt = String::new();
+
+    // Include meeting date/time metadata if available
+    if let Some(date) = meeting_date {
+        final_user_prompt.push_str(&format!(
+            "Meeting date and time: {}\n\n",
+            date
+        ));
+    }
+
+    final_user_prompt.push_str(&format!(
+        r#"<transcript_chunks>
 {}
-</transcript_chunks>
-"#,
+</transcript_chunks>"#,
         content_to_summarize
-    );
+    ));
 
     if !custom_prompt.is_empty() {
         final_user_prompt.push_str("\n\nUser Provided Context:\n\n<user_context>\n");
