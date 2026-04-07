@@ -7,6 +7,7 @@ import { AISummary } from './index';
 import { Block } from '@blocknote/core';
 import { useCreateBlockNote } from '@blocknote/react';
 import { BlockNoteView } from '@blocknote/shadcn';
+import { EditorErrorBoundary } from '../BlockNoteEditor/EditorErrorBoundary';
 import "@blocknote/shadcn/style.css";
 
 // Dynamically import BlockNote Editor to avoid SSR issues
@@ -221,14 +222,15 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
     return (
       <div className="flex flex-col w-full">
         <div className="w-full">
-          <Editor
-            initialContent={data.summary_json}
-            onChange={(blocks) => {
-              console.log('📝 Editor blocks changed:', blocks.length);
-              handleEditorChange(blocks);
-            }}
-            editable={true}
-          />
+          <EditorErrorBoundary fallbackMessage="The summary data for this meeting could not be rendered. Try regenerating the summary.">
+            <Editor
+              initialContent={data.summary_json}
+              onChange={(blocks) => {
+                handleEditorChange(blocks);
+              }}
+              editable={true}
+            />
+          </EditorErrorBoundary>
         </div>
       </div>
     );
@@ -240,16 +242,18 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
     return (
       <div className="flex flex-col w-full">
         <div className="w-full">
-          <BlockNoteView
-            editor={editor}
-            editable={true}
-            onChange={() => {
-              if (isContentLoaded.current) {
-                handleEditorChange(editor.document);
-              }
-            }}
-            theme="light"
-          />
+          <EditorErrorBoundary fallbackMessage="The markdown summary could not be rendered. Try regenerating the summary.">
+            <BlockNoteView
+              editor={editor}
+              editable={true}
+              onChange={() => {
+                if (isContentLoaded.current) {
+                  handleEditorChange(editor.document);
+                }
+              }}
+              theme="light"
+            />
+          </EditorErrorBoundary>
         </div>
       </div>
     );

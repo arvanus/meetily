@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { PartialBlock, Block } from "@blocknote/core";
 import "@blocknote/shadcn/style.css";
 import "@blocknote/core/fonts/inter.css";
@@ -11,41 +11,42 @@ interface EditorProps {
   editable?: boolean;
 }
 
+// Validate that blocks have the minimum required structure for BlockNote/ProseMirror
+function sanitizeBlocks(blocks: Block[] | undefined): PartialBlock[] | undefined {
+  if (!blocks || !Array.isArray(blocks) || blocks.length === 0) {
+    return undefined;
+  }
+
+  try {
+    const valid = blocks.filter(
+      (block): block is Block =>
+        !!block && typeof block === 'object' && !!block.type && typeof block.type === 'string'
+    );
+    return valid.length > 0 ? (valid as PartialBlock[]) : undefined;
+  } catch (err) {
+    console.error('❌ EDITOR: Failed to sanitize blocks, using empty editor:', err);
+    return undefined;
+  }
+}
+
 export default function Editor({ initialContent, onChange, editable = true }: EditorProps) {
-  console.log('📝 EDITOR: Initializing BlockNote editor with blocks:', {
-    hasContent: !!initialContent,
-    blocksCount: initialContent?.length || 0,
-    editable
-  });
+  const [hasError, setHasError] = useState(false);
 
   // Lazy import to avoid SSR issues
   const { useCreateBlockNote } = require("@blocknote/react");
   const { BlockNoteView } = require("@blocknote/shadcn");
 
+  const sanitizedContent = sanitizeBlocks(initialContent);
+
   const editor = useCreateBlockNote({
-    initialContent: initialContent as PartialBlock[] | undefined,
+    initialContent: sanitizedContent,
   });
-
-  console.log('📝 EDITOR: BlockNote editor created successfully');
-
-  // Expose blocksToMarkdown method
-  (editor as any).blocksToMarkdownLossy = async (blocks: Block[]) => {
-    try {
-      return await editor.blocksToMarkdownLossy(blocks);
-    } catch (error) {
-      console.error('❌ EDITOR: Failed to convert blocks to markdown:', error);
-      return '';
-    }
-  };
 
   // Handle content changes
   useEffect(() => {
     if (!onChange) return;
 
     const handleChange = () => {
-      console.log('📝 EDITOR: Content changed, notifying parent...', {
-        blocksCount: editor.document.length
-      });
       onChange(editor.document);
     };
 
@@ -53,11 +54,18 @@ export default function Editor({ initialContent, onChange, editable = true }: Ed
 
     return () => {
       if (typeof unsubscribe === 'function') {
-        console.log('📝 EDITOR: Cleaning up onChange listener');
         unsubscribe();
       }
     };
   }, [editor, onChange]);
+
+  if (hasError) {
+    return (
+      <div className="p-4 text-sm text-red-600 bg-red-50 rounded-md">
+        Failed to render summary editor. The summary data may be corrupted.
+      </div>
+    );
+  }
 
   return <BlockNoteView editor={editor} editable={editable} theme="light" />;
 }
