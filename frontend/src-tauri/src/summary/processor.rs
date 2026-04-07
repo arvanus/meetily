@@ -314,6 +314,15 @@ pub async fn generate_meeting_summary(
     let clean_template_markdown = template.to_markdown_structure();
     let section_instructions = template.to_section_instructions();
 
+    // Build optional context block from template
+    let context_block = match &template.context {
+        Some(ctx) if !ctx.is_empty() => format!(
+            "\n**ADDITIONAL CONTEXT (provided by user):**\n{}\n",
+            ctx
+        ),
+        _ => String::new(),
+    };
+
     let final_system_prompt = format!(
         r#"You are an expert meeting summarizer. Generate a final meeting report by filling in the provided Markdown template based on the source text.
 
@@ -324,7 +333,7 @@ pub async fn generate_meeting_summary(
 4. If a section has no relevant info, write "None noted in this section."
 5. Output **only** the completed Markdown report.
 6. If unsure about something, omit it.
-
+{}
 **SECTION-SPECIFIC INSTRUCTIONS:**
 {}
 
@@ -332,7 +341,7 @@ pub async fn generate_meeting_summary(
 {}
 </template>
 "#,
-        section_instructions, clean_template_markdown
+        context_block, section_instructions, clean_template_markdown
     );
 
     let mut final_user_prompt = String::new();

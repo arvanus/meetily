@@ -32,6 +32,11 @@ pub struct Template {
 
     /// List of sections in the template
     pub sections: Vec<TemplateSection>,
+
+    /// Optional free-form context injected into the LLM prompt
+    /// (e.g., participant names, project descriptions, transcription hints)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl Template {
@@ -127,6 +132,7 @@ mod tests {
                     example_item_format: None,
                 },
             ],
+            context: None,
         };
 
         assert!(template.validate().is_ok());
@@ -138,6 +144,7 @@ mod tests {
             name: "".to_string(),
             description: "A test template".to_string(),
             sections: vec![],
+            context: None,
         };
 
         assert!(template.validate().is_err());
@@ -157,6 +164,7 @@ mod tests {
                     example_item_format: None,
                 },
             ],
+            context: None,
         };
 
         assert!(template.validate().is_err());
