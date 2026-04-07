@@ -832,6 +832,15 @@ impl AudioPipeline {
                         self.last_summary_time = std::time::Instant::now();
                     }
 
+                    // Update real-time audio levels for UI visualization
+                    if !chunk.data.is_empty() {
+                        let rms = (chunk.data.iter().map(|&x| x * x).sum::<f32>() / chunk.data.len() as f32).sqrt();
+                        match chunk.device_type {
+                            DeviceType::Microphone => self.state.set_mic_rms(rms),
+                            DeviceType::System => self.state.set_system_rms(rms),
+                        }
+                    }
+
                     // STEP 1: Add raw audio to ring buffer for mixing
                     // Microphone audio is already normalized at capture level (AudioCapture)
                     // System audio remains raw
@@ -932,6 +941,34 @@ impl AudioPipeline {
 
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
+
+        // First, drain any residual samples from the ring buffer into the VAD processor
+        // This ensures samples that haven't reached a full mixing window are not lost
+        while self.ring_buffer.can_mix() {
+            if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                let mixed = self.mixer.mix_window(&mic_window, &sys_window);
+                let _ = self.vad_processor.process_audio(&mixed);
+            }
+        }
+        // Force one last partial window from whatever remains in the ring buffer
+        // extract_window already zero-pads incomplete buffers, but can_mix requires
+        // at least window_size_samples in one buffer. Force-extract if any data remains.
+        if self.ring_buffer.mic_buffer.len() > 0 || self.ring_buffer.system_buffer.len() > 0 {
+            info!("📤 Draining residual ring buffer: mic={} sys={} samples",
+                  self.ring_buffer.mic_buffer.len(), self.ring_buffer.system_buffer.len());
+            // Temporarily make can_mix pass by extracting manually with zero-padding
+            let mic_remaining: Vec<f32> = self.ring_buffer.mic_buffer.drain(..).collect();
+            let sys_remaining: Vec<f32> = self.ring_buffer.system_buffer.drain(..).collect();
+            let max_len = mic_remaining.len().max(sys_remaining.len());
+            if max_len > 0 {
+                let mut mic_padded = mic_remaining;
+                mic_padded.resize(max_len, 0.0);
+                let mut sys_padded = sys_remaining;
+                sys_padded.resize(max_len, 0.0);
+                let mixed = self.mixer.mix_window(&mic_padded, &sys_padded);
+                let _ = self.vad_processor.process_audio(&mixed);
+            }
+        }
 
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {

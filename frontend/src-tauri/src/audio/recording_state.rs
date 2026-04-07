@@ -127,6 +127,10 @@ pub struct RecordingState {
     // Pause time tracking
     pause_start: Mutex<Option<Instant>>,
     total_pause_duration: Mutex<std::time::Duration>,
+
+    // Real-time audio levels for UI visualization (stored as f32 bits in AtomicU32)
+    mic_rms_level: AtomicU32,
+    system_rms_level: AtomicU32,
 }
 
 impl RecordingState {
@@ -148,6 +152,8 @@ impl RecordingState {
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
+            mic_rms_level: AtomicU32::new(0),
+            system_rms_level: AtomicU32::new(0),
         })
     }
 
@@ -212,6 +218,26 @@ impl RecordingState {
 
     pub fn is_recording(&self) -> bool {
         self.is_recording.load(Ordering::SeqCst)
+    }
+
+    /// Update real-time audio level for mic (called from pipeline hot path)
+    pub fn set_mic_rms(&self, rms: f32) {
+        self.mic_rms_level.store(rms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Update real-time audio level for system audio (called from pipeline hot path)
+    pub fn set_system_rms(&self, rms: f32) {
+        self.system_rms_level.store(rms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Read current mic RMS level (0.0 to 1.0)
+    pub fn mic_rms(&self) -> f32 {
+        f32::from_bits(self.mic_rms_level.load(Ordering::Relaxed))
+    }
+
+    /// Read current system audio RMS level (0.0 to 1.0)
+    pub fn system_rms(&self) -> f32 {
+        f32::from_bits(self.system_rms_level.load(Ordering::Relaxed))
     }
 
     pub fn is_paused(&self) -> bool {
@@ -436,6 +462,8 @@ impl Default for RecordingState {
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
+            mic_rms_level: AtomicU32::new(0),
+            system_rms_level: AtomicU32::new(0),
         }
     }
 }

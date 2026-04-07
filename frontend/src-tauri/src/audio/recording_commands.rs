@@ -45,6 +45,9 @@ static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
+// Audio level emission task handle for cleanup on stop
+static AUDIO_LEVEL_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
 // ============================================================================
 // PUBLIC TYPES
 // ============================================================================
@@ -236,6 +239,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
+    // Get recording state before storing manager (for audio level emission)
+    let recording_state_arc = manager.recording_state();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -246,6 +252,32 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     IS_RECORDING.store(true, Ordering::SeqCst);
     reset_speech_detected_flag(); // Reset for new recording session
+
+    // Spawn audio level emission task - reads real RMS from pipeline and emits to frontend
+    {
+        let app_for_levels = app.clone();
+        let level_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
+            while IS_RECORDING.load(Ordering::SeqCst) {
+                interval.tick().await;
+                let mic_rms = recording_state_arc.mic_rms();
+                let sys_rms = recording_state_arc.system_rms();
+
+                let update = serde_json::json!({
+                    "mic_rms": mic_rms,
+                    "system_rms": sys_rms,
+                });
+
+                if let Err(e) = app_for_levels.emit("audio-levels", &update) {
+                    error!("Failed to emit audio levels: {}", e);
+                    break;
+                }
+            }
+            info!("Audio level emission task ended");
+        });
+        let mut global_level_task = AUDIO_LEVEL_TASK.lock().unwrap();
+        *global_level_task = Some(level_task);
+    }
 
     // Start optimized parallel transcription task and store handle
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -532,15 +564,9 @@ pub async fn stop_recording<R: Runtime>(
         }
     }
 
-    // Step 1.5: Clean up transcript listener to release microphone
-    // Unlisten transcript-update event to prevent lingering references
-    {
-        use tauri::Listener;
-        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
-            app.unlisten(listener_id);
-            info!("✅ Transcript-update listener removed");
-        }
-    }
+    // NOTE: Transcript listener is kept alive until AFTER workers finish processing.
+    // Moving unlisten before worker completion caused the last flushed segments to be lost,
+    // because the listener was removed while workers were still transcribing flushed audio.
 
     // Step 2: Signal transcription workers to finish processing ALL queued chunks
     let _ = app.emit(
@@ -606,6 +632,15 @@ pub async fn stop_recording<R: Runtime>(
         progress_task.abort();
     } else {
         info!("ℹ️ No transcription task found to wait for");
+    }
+
+    // Step 2.5: NOW remove transcript listener - all workers have finished
+    {
+        use tauri::Listener;
+        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
+            app.unlisten(listener_id);
+            info!("✅ Transcript-update listener removed (after all workers finished)");
+        }
     }
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
@@ -844,9 +879,17 @@ pub async fn stop_recording<R: Runtime>(
         (None, None)
     };
 
-    // Set recording flag to false
+    // Set recording flag to false (this also stops the audio level emission task)
     info!("🔍 Setting IS_RECORDING to false");
     IS_RECORDING.store(false, Ordering::SeqCst);
+
+    // Clean up audio level emission task
+    {
+        let mut level_task = AUDIO_LEVEL_TASK.lock().unwrap();
+        if let Some(handle) = level_task.take() {
+            handle.abort();
+        }
+    }
 
     // Step 4.5: Prepare metadata for frontend (NO database save)
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.

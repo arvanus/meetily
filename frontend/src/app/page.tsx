@@ -26,7 +26,7 @@ import { Loader2 } from 'lucide-react';
 export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
-  const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
+  const [barHeights, setBarHeights] = useState(['10%', '10%', '10%', '10%', '10%']);
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
 
   // Use contexts for state management
@@ -193,19 +193,36 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (recordingState.isRecording) {
-      const interval = setInterval(() => {
-        setBarHeights(prev => {
-          const newHeights = [...prev];
-          newHeights[0] = Math.random() * 20 + 10 + 'px';
-          newHeights[1] = Math.random() * 20 + 10 + 'px';
-          newHeights[2] = Math.random() * 20 + 10 + 'px';
-          return newHeights;
-        });
-      }, 300);
-
-      return () => clearInterval(interval);
+    if (!recordingState.isRecording) {
+      setBarHeights(['10%', '10%', '10%', '10%', '10%']);
+      return;
     }
+
+    let unlisten: (() => void) | undefined;
+    let mounted = true;
+    let smoothedLevel = 0;
+
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      listen<{ mic_rms: number; system_rms: number }>('audio-levels', (event) => {
+        if (!mounted) return;
+        const { mic_rms, system_rms } = event.payload;
+        const rawLevel = Math.min(1.0, mic_rms * 3 + system_rms * 1.5);
+        // EMA smoothing: rise fast (0.4), fall slow (0.15) for natural feel
+        const alpha = rawLevel > smoothedLevel ? 0.4 : 0.15;
+        smoothedLevel = smoothedLevel + alpha * (rawLevel - smoothedLevel);
+
+        const barMultipliers = [0.6, 0.85, 1.0, 0.75, 0.5];
+        const minHeight = 12;
+        const maxHeight = 95;
+        const newHeights = barMultipliers.map(mult => {
+          const height = minHeight + (maxHeight - minHeight) * smoothedLevel * mult;
+          return Math.min(maxHeight, Math.max(minHeight, height)) + '%';
+        });
+        setBarHeights(newHeights);
+      }).then(fn => { unlisten = fn; });
+    });
+
+    return () => { mounted = false; unlisten?.(); };
   }, [recordingState.isRecording]);
 
   // Computed values using global status

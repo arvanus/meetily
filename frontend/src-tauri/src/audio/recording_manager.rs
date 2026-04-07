@@ -53,7 +53,10 @@ impl RecordingManager {
         }
     }
 
-    // Remove app handle storage for now - will be passed directly when saving
+    /// Get a clone of the recording state Arc for external use (e.g., audio level emission)
+    pub fn recording_state(&self) -> Arc<RecordingState> {
+        self.state.clone()
+    }
 
     /// Start recording with specified devices
     ///
