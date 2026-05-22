@@ -376,6 +376,42 @@ Scope of the drop zone: only when the cursor is over the context textarea
 region. Other drop zones in the app (e.g., import audio) keep their own
 handlers; we filter by component-level state to avoid global conflicts.
 
+## 5.6 Rename: `customPrompt` → `contextPrompt`
+
+The existing name `customPrompt` (TS) / `custom_prompt` (Rust) is misleading:
+the value is not a "prompt" (it is content embedded *inside* a prompt) and
+nothing about it is "custom" in the configurable sense. As part of this work,
+rename everywhere except the analytics layer (kept as-is to preserve event
+continuity in dashboards).
+
+### TypeScript / React (camelCase → `contextPrompt`)
+
+| File | Old | New |
+|---|---|---|
+| `app/meeting-details/page-content.tsx` | `customPrompt` state | `contextPrompt` state |
+| `hooks/meeting-details/useSummaryGeneration.ts` | `customPrompt` arg | parameter removed entirely (see §5.4) |
+| `components/MeetingDetails/TranscriptPanel.tsx` | `customPrompt`, `onPromptChange` props | `contextPrompt`, `onContextPromptChange` (or pulled from `useSummaryContext`) |
+| `components/MeetingDetails/SummaryPanel.tsx` | `customPrompt` prop | `contextPrompt` prop |
+| `components/MeetingDetails/SummaryGeneratorButtonGroup.tsx` | `customPrompt` prop, `onGenerateSummary(customPrompt)` | `contextPrompt` prop; `onGenerateSummary()` (no arg) |
+
+### Rust (snake_case → `context_prompt`)
+
+| File | Old | New |
+|---|---|---|
+| `summary/commands.rs` (`api_process_transcript`) | `custom_prompt: Option<String>` parameter | parameter removed; backend loads from DB |
+| `summary/service.rs` (`process_transcript_background`) | `custom_prompt: String` | `context_prompt: String` (or removed if read inside) |
+| `summary/processor.rs` (`generate_meeting_summary`) | `custom_prompt: &str` | `context_prompt: &str` |
+
+### Kept as `custom_prompt` (analytics — intentional exception)
+
+- `analytics/analytics.rs::track_custom_prompt_used`
+- `analytics/commands.rs::track_custom_prompt_used`
+- Event name `custom_prompt_used` in PostHog/telemetry
+
+Renaming analytics events breaks dashboard continuity. The function name and
+the event string stay; the frontend caller just passes the new variable into
+the existing signature: `Analytics.trackCustomPromptUsed(contextPrompt.trim().length)`.
+
 ## 6. Error handling
 
 | Scenario | Behavior |
