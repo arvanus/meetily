@@ -143,7 +143,8 @@ pub fn extract_meeting_name_from_markdown(markdown: &str) -> Option<String> {
 /// * `model_name` - Specific model name
 /// * `api_key` - API key for the provider
 /// * `text` - Full transcript text to summarize
-/// * `custom_prompt` - Optional user-provided context
+/// * `context_prompt` - Persisted per-meeting user-provided context (textarea)
+/// * `attachments` - Text-file attachments to inline into the user prompt
 /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
 /// * `token_threshold` - Token limit for single-pass processing (default 4000)
 /// * `ollama_endpoint` - Optional custom Ollama endpoint
@@ -162,7 +163,8 @@ pub async fn generate_meeting_summary(
     model_name: &str,
     api_key: &str,
     text: &str,
-    custom_prompt: &str,
+    context_prompt: &str,
+    attachments: &[crate::summary::context::types::AttachmentContent],
     template_id: &str,
     token_threshold: usize,
     ollama_endpoint: Option<&str>,
@@ -361,9 +363,14 @@ pub async fn generate_meeting_summary(
         content_to_summarize
     ));
 
-    if !custom_prompt.is_empty() {
+    // Inline file attachments before the free-form user context.
+    final_user_prompt.push_str(&crate::summary::context::prompt_builder::render_attachments_block(
+        attachments,
+    ));
+
+    if !context_prompt.is_empty() {
         final_user_prompt.push_str("\n\nUser Provided Context:\n\n<user_context>\n");
-        final_user_prompt.push_str(custom_prompt);
+        final_user_prompt.push_str(context_prompt);
         final_user_prompt.push_str("\n</user_context>");
     }
 

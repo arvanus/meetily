@@ -70,8 +70,10 @@ impl SummaryService {
     /// * `text` - Full transcript text
     /// * `model_provider` - LLM provider name (e.g., "ollama", "openai")
     /// * `model_name` - Specific model (e.g., "gpt-4", "llama3.2:latest")
-    /// * `custom_prompt` - Optional user-provided context
     /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
+    ///
+    /// The per-meeting context (textarea + file attachments) is loaded from
+    /// the database internally; it is not a parameter.
     pub async fn process_transcript_background<R: tauri::Runtime>(
         _app: AppHandle<R>,
         pool: SqlitePool,
@@ -79,7 +81,6 @@ impl SummaryService {
         text: String,
         model_provider: String,
         model_name: String,
-        custom_prompt: String,
         template_id: String,
     ) {
         let start_time = Instant::now();
@@ -225,6 +226,49 @@ impl SummaryService {
             _ => None,
         };
 
+        // Load persisted context_prompt (free-form textarea) and attachments.
+        let context_prompt = crate::summary::context::repository::SummaryContextRepository::get_prompt(
+            &pool, &meeting_id,
+        )
+        .await
+        .unwrap_or_default();
+
+        let attachments = {
+            use crate::summary::context::{
+                repository::ContextAttachmentsRepository, types::AttachmentContent,
+            };
+            let rows = ContextAttachmentsRepository::list(&pool, &meeting_id)
+                .await
+                .unwrap_or_default();
+            let folder_row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT folder_path FROM meetings WHERE id = ?")
+                    .bind(&meeting_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(None);
+            let folder = folder_row.and_then(|(p,)| p).map(std::path::PathBuf::from);
+            let mut out = Vec::with_capacity(rows.len());
+            if let Some(folder) = folder {
+                for row in rows {
+                    let path = folder.join("attachments").join(&row.stored_filename);
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => out.push(AttachmentContent {
+                            display_name: row.display_name,
+                            content,
+                            truncated: row.truncated,
+                        }),
+                        Err(e) => {
+                            warn!(
+                                "Skipping attachment {} (read failed): {}",
+                                row.stored_filename, e
+                            );
+                        }
+                    }
+                }
+            }
+            out
+        };
+
         // Generate summary
         let client = reqwest::Client::new();
         let result = generate_meeting_summary(
@@ -233,7 +277,8 @@ impl SummaryService {
             &model_name,
             &final_api_key,
             &text,
-            &custom_prompt,
+            &context_prompt,
+            &attachments,
             &template_id,
             token_threshold,
             ollama_endpoint.as_deref(),
