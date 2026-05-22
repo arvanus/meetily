@@ -12,7 +12,19 @@ use chrono::Utc;
 use log::{info as log_info, warn as log_warn};
 use std::path::PathBuf;
 use tauri::{AppHandle, Runtime};
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
+
+/// Allowed text extensions for the file picker.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "log", "csv", "tsv", "json", "yaml", "yml",
+    "toml", "ini", "xml", "html", "htm", "css", "scss", "sass",
+    "js", "jsx", "ts", "tsx", "mjs", "cjs",
+    "py", "rs", "go", "java", "kt", "kts", "rb", "php", "swift",
+    "c", "h", "cpp", "hpp", "cc", "hh", "cs",
+    "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
+    "sql", "graphql", "proto", "tex", "vue", "svelte",
+];
 
 const MAX_ATTACHMENTS_PER_MEETING: i64 = 10;
 const MAX_TOTAL_BYTES: i64 = 1024 * 1024;
@@ -176,6 +188,26 @@ pub async fn api_remove_context_attachment(
         .await
         .map_err(|e| format!("DB error: {}", e))?;
     Ok(())
+}
+
+/// Opens a native file picker filtered to text extensions.
+/// Returns the selected path or None if the user cancelled.
+#[tauri::command]
+pub async fn api_pick_context_attachment_file<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<String>, String> {
+    let app_clone = app.clone();
+    let file_path = tokio::task::spawn_blocking(move || {
+        app_clone
+            .dialog()
+            .file()
+            .add_filter("Arquivos de texto", TEXT_EXTENSIONS)
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|e| format!("File dialog task failed: {}", e))?;
+
+    Ok(file_path.map(|p| p.to_string()))
 }
 
 #[tauri::command]

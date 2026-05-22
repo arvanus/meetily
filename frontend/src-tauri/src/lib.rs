@@ -683,6 +683,7 @@ pub fn run() {
             summary::api_add_context_attachment,
             summary::api_remove_context_attachment,
             summary::api_open_context_attachment,
+            summary::api_pick_context_attachment_file,
             // Template commands
             summary::api_list_templates,
             summary::api_get_template_details,

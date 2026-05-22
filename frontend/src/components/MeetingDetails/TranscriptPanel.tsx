@@ -1,15 +1,22 @@
 "use client";
 
 import { Transcript, TranscriptSegmentData } from '@/types';
-import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
-import { useMemo } from 'react';
+import { ContextAttachmentsBar } from './ContextAttachmentsBar';
+import type { ContextAttachment } from '@/hooks/meeting-details/useSummaryContext';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
   contextPrompt: string;
   onContextPromptChange: (value: string) => void;
+  attachments: ContextAttachment[];
+  onPickAttachment: () => Promise<void>;
+  onAddAttachment: (sourcePath: string) => Promise<void>;
+  onRemoveAttachment: (id: string) => Promise<void>;
+  onOpenAttachment: (id: string) => Promise<void>;
   onCopyTranscript: () => void;
   onOpenMeetingFolder: () => Promise<void>;
   isRecording: boolean;
@@ -34,6 +41,11 @@ export function TranscriptPanel({
   transcripts,
   contextPrompt,
   onContextPromptChange,
+  attachments,
+  onPickAttachment,
+  onAddAttachment,
+  onRemoveAttachment,
+  onOpenAttachment,
   onCopyTranscript,
   onOpenMeetingFolder,
   isRecording,
@@ -49,12 +61,10 @@ export function TranscriptPanel({
   meetingFolderPath,
   onRefetchTranscripts,
 }: TranscriptPanelProps) {
-  // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
     if (usePagination && segments) {
       return segments;
     }
-    // Convert transcripts to segments for virtualization
     return transcripts.map(t => ({
       id: t.id,
       timestamp: t.audio_start_time ?? 0,
@@ -63,6 +73,57 @@ export function TranscriptPanel({
       confidence: t.confidence,
     }));
   }, [transcripts, usePagination, segments]);
+
+  // Native (Tauri) drag-and-drop for adding attachments.
+  const dropRef = useRef<HTMLDivElement>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        const webview = getCurrentWebview();
+        const handle = await webview.onDragDropEvent((event) => {
+          const el = dropRef.current;
+          if (!el) return;
+          const rect = el.getBoundingClientRect();
+          const pos = (event.payload as { position?: { x: number; y: number } }).position;
+          const inside =
+            !!pos &&
+            pos.x >= rect.left &&
+            pos.x <= rect.right &&
+            pos.y >= rect.top &&
+            pos.y <= rect.bottom;
+
+          if (event.payload.type === 'over') {
+            setDragOver(inside);
+          } else if (event.payload.type === 'drop') {
+            setDragOver(false);
+            const paths = (event.payload as { paths?: string[] }).paths;
+            if (inside && paths && paths.length > 0) {
+              for (const p of paths) {
+                void onAddAttachment(p);
+              }
+            }
+          } else if (event.payload.type === 'leave') {
+            setDragOver(false);
+          }
+        });
+        if (cancelled) {
+          handle();
+        } else {
+          unlisten = handle;
+        }
+      } catch (e) {
+        console.warn('Failed to install drag-drop listener:', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [onAddAttachment]);
 
   return (
     <div className="hidden md:flex md:w-1/4 lg:w-1/3 min-w-0 border-r border-gray-200 bg-white flex-col relative shrink-0">
@@ -97,15 +158,30 @@ export function TranscriptPanel({
         />
       </div>
 
-      {/* Custom prompt input at bottom of transcript section */}
+      {/* Context attachments + textarea */}
       {!isRecording && convertedSegments.length > 0 && (
-        <div className="p-1 border-t border-gray-200">
-          <textarea
-            placeholder="Add context for AI summary. For example people involved, meeting overview, objective etc..."
-            className="w-full px-3 py-2 border border-gray-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 bg-white shadow-sm min-h-[80px] resize-y"
-            value={contextPrompt}
-            onChange={(e) => onContextPromptChange(e.target.value)}
+        <div
+          ref={dropRef}
+          className={dragOver ? 'ring-2 ring-blue-300 bg-blue-50/40 transition-colors' : 'transition-colors'}
+        >
+          <ContextAttachmentsBar
+            attachments={attachments}
+            onPick={onPickAttachment}
+            onRemove={onRemoveAttachment}
+            onOpen={onOpenAttachment}
           />
+          <div className="p-1 border-t border-gray-200">
+            <textarea
+              placeholder={
+                dragOver
+                  ? 'Solte para anexar...'
+                  : 'Add context for AI summary. For example people involved, meeting overview, objective etc...'
+              }
+              className="w-full px-3 py-2 border border-gray-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 bg-white shadow-sm min-h-[80px] resize-y"
+              value={contextPrompt}
+              onChange={(e) => onContextPromptChange(e.target.value)}
+            />
+          </div>
         </div>
       )}
     </div>

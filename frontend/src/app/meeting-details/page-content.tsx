@@ -13,6 +13,7 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 // Custom hooks
 import { useMeetingData } from '@/hooks/meeting-details/useMeetingData';
 import { useSummaryGeneration } from '@/hooks/meeting-details/useSummaryGeneration';
+import { useSummaryContext } from '@/hooks/meeting-details/useSummaryContext';
 import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
@@ -54,9 +55,11 @@ export default function PageContent({
   });
 
   // State
-  const [contextPrompt, setContextPrompt] = useState<string>('');
   const [isRecording] = useState(false);
   const [summaryResponse] = useState<SummaryResponse | null>(null);
+
+  // Per-meeting context (textarea + file attachments) persisted in DB
+  const summaryContext = useSummaryContext(meeting.id);
 
   // Ref to store the modal open function from SummaryGeneratorButtonGroup
   const openModelSettingsRef = useRef<(() => void) | null>(null);
@@ -173,8 +176,13 @@ export default function PageContent({
       <div className="flex flex-1 overflow-hidden">
         <TranscriptPanel
           transcripts={meetingData.transcripts}
-          contextPrompt={contextPrompt}
-          onContextPromptChange={setContextPrompt}
+          contextPrompt={summaryContext.contextPrompt}
+          onContextPromptChange={summaryContext.setContextPrompt}
+          attachments={summaryContext.attachments}
+          onPickAttachment={summaryContext.pickAndAddAttachment}
+          onAddAttachment={summaryContext.addAttachment}
+          onRemoveAttachment={summaryContext.removeAttachment}
+          onOpenAttachment={summaryContext.openAttachment}
           onCopyTranscript={copyOperations.handleCopyTranscript}
           onOpenMeetingFolder={meetingOperations.handleOpenMeetingFolder}
           isRecording={isRecording}
