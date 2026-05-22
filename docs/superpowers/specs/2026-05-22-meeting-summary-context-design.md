@@ -34,6 +34,14 @@ persistence and richer input.
 
 ## 3. Non-goals
 
+- **Touching `Template.context`** (the optional context field on summary
+  templates, added by commit `b6bc8f7`). That field is **separate from this
+  feature**: it lives on the template (not per-meeting), is injected into the
+  *system prompt* as `**ADDITIONAL CONTEXT (provided by user):**`, and is
+  defined when the template is created. This spec only persists the
+  per-meeting *user prompt* context (the textarea). Both mechanisms coexist
+  unchanged in the final prompt — `Template.context` in the system message,
+  `meeting_summary_context.context_prompt` + attachments in the user message.
 - Binary/document formats (PDF, DOCX, images). Text-only for v1.
 - Provider-native attachment APIs (Claude PDF upload, OpenAI files). Always
   inline text content into the prompt; this keeps behavior uniform across
