@@ -677,6 +677,12 @@ pub fn run() {
             summary::api_get_summary,
             summary::api_save_meeting_summary,
             summary::api_cancel_summary,
+            // Summary context commands
+            summary::api_save_summary_context,
+            summary::api_get_summary_context,
+            summary::api_add_context_attachment,
+            summary::api_remove_context_attachment,
+            summary::api_open_context_attachment,
             // Template commands
             summary::api_list_templates,
             summary::api_get_template_details,

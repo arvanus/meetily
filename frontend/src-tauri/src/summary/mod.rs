@@ -53,6 +53,14 @@ pub use template_commands::{
     api_get_template_details, api_list_templates, api_validate_template,
 };
 
+// Re-export summary context commands
+pub use context::{
+    __cmd__api_add_context_attachment, __cmd__api_get_summary_context,
+    __cmd__api_open_context_attachment, __cmd__api_remove_context_attachment,
+    __cmd__api_save_summary_context, api_add_context_attachment, api_get_summary_context,
+    api_open_context_attachment, api_remove_context_attachment, api_save_summary_context,
+};
+
 // Re-export commonly used items
 pub use llm_client::LLMProvider;
 pub use processor::{
