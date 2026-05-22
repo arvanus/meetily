@@ -28,9 +28,8 @@ interface SummaryGeneratorButtonGroupProps {
   modelConfig: ModelConfig;
   setModelConfig: (config: ModelConfig | ((prev: ModelConfig) => ModelConfig)) => void;
   onSaveModelConfig: (config?: ModelConfig) => Promise<void>;
-  onGenerateSummary: (customPrompt: string) => Promise<void>;
+  onGenerateSummary: () => Promise<void>;
   onStopGeneration: () => void;
-  customPrompt: string;
   summaryStatus: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
   availableTemplates: Array<{ id: string, name: string, description: string }>;
   selectedTemplate: string;
@@ -46,7 +45,6 @@ export function SummaryGeneratorButtonGroup({
   onSaveModelConfig,
   onGenerateSummary,
   onStopGeneration,
-  customPrompt,
   summaryStatus,
   availableTemplates,
   selectedTemplate,
@@ -102,7 +100,7 @@ export function SummaryGeneratorButtonGroup({
 
       if (isReady) {
         // Model is available, proceed with generation
-        onGenerateSummary(customPrompt);
+        onGenerateSummary();
         return;
       }
 
@@ -185,7 +183,7 @@ export function SummaryGeneratorButtonGroup({
 
     // Only check for Ollama provider
     if (modelConfig.provider !== 'ollama') {
-      onGenerateSummary(customPrompt);
+      onGenerateSummary();
       return;
     }
 
@@ -205,7 +203,7 @@ export function SummaryGeneratorButtonGroup({
       }
 
       // Models are available, proceed with generation
-      onGenerateSummary(customPrompt);
+      onGenerateSummary();
     } catch (error) {
       console.error('Error checking Ollama models:', error);
       const errorMessage = error instanceof Error ? error.message : String(error);

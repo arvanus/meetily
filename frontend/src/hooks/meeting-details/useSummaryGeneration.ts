@@ -60,11 +60,9 @@ export function useSummaryGeneration({
   // Unified summary processing logic
   const processSummary = useCallback(async ({
     transcriptText,
-    customPrompt = '',
     isRegeneration = false,
   }: {
     transcriptText: string;
-    customPrompt?: string;
     isRegeneration?: boolean;
   }) => {
     setSummaryStatus(isRegeneration ? 'regenerating' : 'processing');
@@ -92,9 +90,17 @@ export function useSummaryGeneration({
         timeSinceRecording
       );
 
-      // Track custom prompt usage if present
-      if (customPrompt.trim().length > 0) {
-        await Analytics.trackCustomPromptUsed(customPrompt.trim().length);
+      // Track persisted context usage if present (loaded from DB).
+      try {
+        const ctx = await invokeTauri('api_get_summary_context', {
+          meetingId: meeting.id,
+        }) as { context_prompt: string };
+        if (ctx?.context_prompt?.trim().length > 0) {
+          await Analytics.trackCustomPromptUsed(ctx.context_prompt.trim().length);
+        }
+      } catch (e) {
+        // Non-fatal: analytics shouldn't block generation.
+        console.warn('Could not fetch context for analytics:', e);
       }
 
       // Show toast notification for generation start
@@ -103,7 +109,8 @@ export function useSummaryGeneration({
         duration: 3000,
       });
 
-      // Process transcript and get process_id
+      // Process transcript and get process_id. The backend loads the
+      // persisted context_prompt + attachments by meeting_id.
       const result = await invokeTauri('api_process_transcript', {
         text: transcriptText,
         model: modelConfig.provider,
@@ -111,7 +118,6 @@ export function useSummaryGeneration({
         meetingId: meeting.id,
         chunkSize: 40000,
         overlap: 1000,
-        customPrompt: customPrompt,
         templateId: selectedTemplate,
       }) as any;
 
@@ -390,7 +396,7 @@ export function useSummaryGeneration({
   }, []);
 
   // Public API: Generate summary from transcripts
-  const handleGenerateSummary = useCallback(async (customPrompt: string = '') => {
+  const handleGenerateSummary = useCallback(async () => {
     // Check if model config is still loading
     if (isModelConfigLoading) {
       console.log('⏳ Model configuration is still loading, please wait...');
@@ -565,7 +571,7 @@ export function useSummaryGeneration({
       })
       .join('\n');
 
-    await processSummary({ transcriptText: fullTranscript, customPrompt });
+    await processSummary({ transcriptText: fullTranscript });
   }, [meeting.id, fetchAllTranscripts, processSummary, modelConfig, isModelConfigLoading, selectedTemplate]);
 
   // Public API: Regenerate summary from original transcript

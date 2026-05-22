@@ -54,7 +54,7 @@ export default function PageContent({
   });
 
   // State
-  const [customPrompt, setCustomPrompt] = useState<string>('');
+  const [contextPrompt, setContextPrompt] = useState<string>('');
   const [isRecording] = useState(false);
   const [summaryResponse] = useState<SummaryResponse | null>(null);
 
@@ -146,7 +146,7 @@ export default function PageContent({
     const autoGenerate = async () => {
       if (shouldAutoGenerate && meetingData.transcripts.length > 0 && !cancelled) {
         console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
-        await summaryGeneration.handleGenerateSummary('');
+        await summaryGeneration.handleGenerateSummary();
 
         // Notify parent that auto-generation is complete (only if not cancelled)
         if (onAutoGenerateComplete && !cancelled) {
@@ -173,8 +173,8 @@ export default function PageContent({
       <div className="flex flex-1 overflow-hidden">
         <TranscriptPanel
           transcripts={meetingData.transcripts}
-          customPrompt={customPrompt}
-          onPromptChange={setCustomPrompt}
+          contextPrompt={contextPrompt}
+          onContextPromptChange={setContextPrompt}
           onCopyTranscript={copyOperations.handleCopyTranscript}
           onOpenMeetingFolder={meetingOperations.handleOpenMeetingFolder}
           isRecording={isRecording}
@@ -213,7 +213,6 @@ export default function PageContent({
           onSaveModelConfig={handleSaveModelConfig}
           onGenerateSummary={summaryGeneration.handleGenerateSummary}
           onStopGeneration={summaryGeneration.handleStopGeneration}
-          customPrompt={customPrompt}
           summaryResponse={summaryResponse}
           onSaveSummary={meetingData.handleSaveSummary}
           onSummaryChange={meetingData.handleSummaryChange}

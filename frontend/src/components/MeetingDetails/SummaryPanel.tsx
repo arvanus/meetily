@@ -33,9 +33,8 @@ interface SummaryPanelProps {
   modelConfig: ModelConfig;
   setModelConfig: (config: ModelConfig | ((prev: ModelConfig) => ModelConfig)) => void;
   onSaveModelConfig: (config?: ModelConfig) => Promise<void>;
-  onGenerateSummary: (customPrompt: string) => Promise<void>;
+  onGenerateSummary: () => Promise<void>;
   onStopGeneration: () => void;
-  customPrompt: string;
   summaryResponse: SummaryResponse | null;
   onSaveSummary: (summary: Summary | { markdown?: string; summary_json?: any[] }) => Promise<void>;
   onSummaryChange: (summary: Summary) => void;
@@ -71,7 +70,6 @@ export function SummaryPanel({
   onSaveModelConfig,
   onGenerateSummary,
   onStopGeneration,
-  customPrompt,
   summaryResponse,
   onSaveSummary,
   onSummaryChange,
@@ -110,7 +108,6 @@ export function SummaryPanel({
                 onSaveModelConfig={onSaveModelConfig}
                 onGenerateSummary={onGenerateSummary}
                 onStopGeneration={onStopGeneration}
-                customPrompt={customPrompt}
                 summaryStatus={summaryStatus}
                 availableTemplates={availableTemplates}
                 selectedTemplate={selectedTemplate}
@@ -150,7 +147,6 @@ export function SummaryPanel({
               onSaveModelConfig={onSaveModelConfig}
               onGenerateSummary={onGenerateSummary}
               onStopGeneration={onStopGeneration}
-              customPrompt={customPrompt}
               summaryStatus={summaryStatus}
               availableTemplates={availableTemplates}
               selectedTemplate={selectedTemplate}
@@ -178,7 +174,6 @@ export function SummaryPanel({
               onSaveModelConfig={onSaveModelConfig}
               onGenerateSummary={onGenerateSummary}
               onStopGeneration={onStopGeneration}
-              customPrompt={customPrompt}
               summaryStatus={summaryStatus}
               availableTemplates={availableTemplates}
               selectedTemplate={selectedTemplate}
@@ -190,7 +185,7 @@ export function SummaryPanel({
           </div>
           {/* Empty state message */}
           <EmptyStateSummary
-            onGenerate={() => onGenerateSummary(customPrompt)}
+            onGenerate={() => onGenerateSummary()}
             hasModel={modelConfig.provider !== null && modelConfig.model !== null}
             isGenerating={isSummaryLoading}
           />
