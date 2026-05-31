@@ -40,8 +40,9 @@ impl AudioMixerRingBuffer {
         let window_ms = 50.0;
         let window_size_samples = (sample_rate as f32 * window_ms / 1000.0) as usize;
 
-        // Max buffer provides headroom for jitter between mic and system streams.
-        // 400ms is sufficient with || in can_mix (doesn't wait for both buffers).
+        // Max buffer provides headroom for phase jitter between mic and system
+        // streams. can_mix() waits for both buffers (aligned, no padding) and
+        // only pads via the 3-window starvation fallback, so 400ms is ample.
         let max_buffer_size = window_size_samples * 8;  // 400ms
 
         info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
@@ -95,8 +96,21 @@ impl AudioMixerRingBuffer {
     }
 
     fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples ||
-        self.system_buffer.len() >= self.window_size_samples
+        let w = self.window_size_samples;
+        let mic = self.mic_buffer.len();
+        let sys = self.system_buffer.len();
+
+        // Normal case: BOTH streams have a full window → mix time-aligned with
+        // no zero-padding. This is what prevents the stereo "picote": padding
+        // the lagging stream injected silence that, once the channels were kept
+        // separate (mic=L, sys=R), became audible choppiness on each channel.
+        (mic >= w && sys >= w)
+        // Starvation fallback: one stream is far ahead (>=3 windows / 150ms)
+        // while its partner can't even fill one window → the partner is idle /
+        // not delivering (e.g. only the mic is producing sound). Emit a padded
+        // window to bound latency instead of stalling the recording forever.
+        || (mic >= 3 * w && sys < w)
+        || (sys >= 3 * w && mic < w)
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -1203,5 +1217,92 @@ mod tests {
         let right = vec![3.0];
         let mut out = Vec::new();
         interleave_stereo_into(&left, &right, &mut out);
+    }
+
+    // ----- Ring buffer mixing: alignment / stereo "picote" regression -----
+
+    /// When one stream has a full window but its partner only has PARTIAL
+    /// real data, mixing must wait — extracting now would zero-pad the
+    /// partner, injecting silence that becomes audible choppiness on the
+    /// separate stereo channel.
+    #[test]
+    fn test_can_mix_waits_for_both_when_partner_has_partial_data() {
+        let mut rb = AudioMixerRingBuffer::new(48000);
+        let w = rb.window_size_samples;
+
+        rb.add_samples(DeviceType::Microphone, vec![1.0; w]);
+        rb.add_samples(DeviceType::System, vec![2.0; w / 2]);
+        assert!(
+            !rb.can_mix(),
+            "must wait while system has partial real data (padding would inject silence)"
+        );
+
+        // System completes its window → aligned mixing is now safe.
+        rb.add_samples(DeviceType::System, vec![2.0; w / 2]);
+        assert!(rb.can_mix(), "both have a full window → mix");
+    }
+
+    /// If the partner stream is genuinely idle (empty, not delivering) and the
+    /// leader runs far ahead, the starvation fallback must allow a padded
+    /// window so single-source recording doesn't stall forever.
+    #[test]
+    fn test_can_mix_starvation_fallback_when_partner_idle() {
+        let mut rb = AudioMixerRingBuffer::new(48000);
+        let w = rb.window_size_samples;
+
+        // Just under the 3-window threshold while partner empty → still wait.
+        rb.add_samples(DeviceType::Microphone, vec![1.0; 3 * w - 1]);
+        assert!(!rb.can_mix(), "below starvation threshold → keep waiting for partner");
+
+        // Reaches 3 windows with partner still idle → fallback fires.
+        rb.add_samples(DeviceType::Microphone, vec![1.0; 1]);
+        assert!(rb.can_mix(), "leader >=3 windows + partner idle → padded fallback to avoid stall");
+    }
+
+    /// Regression for the stereo "picote": with BOTH streams active but a
+    /// constant phase offset (different chunk cadences), the old `||` can_mix
+    /// extracted the instant ONE buffer crossed the threshold, zero-padding
+    /// the lagging stream every window. Summation masked it in mono; stereo
+    /// exposed it as silence holes on each channel.
+    ///
+    /// We feed continuous NON-ZERO data to both streams at equal rate with a
+    /// fixed offset and assert no extracted window contains injected silence.
+    #[test]
+    fn test_no_silence_injection_when_both_streams_active() {
+        let mut rb = AudioMixerRingBuffer::new(48000);
+        let w = rb.window_size_samples;
+
+        const MIC: f32 = 1.0;
+        const SYS: f32 = 2.0;
+
+        // Prime mic so the two buffers stay ~800 samples out of phase forever,
+        // then feed identical-size chunks (equal rate) to both.
+        rb.add_samples(DeviceType::Microphone, vec![MIC; 800]);
+
+        let mut windows: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        for _ in 0..300 {
+            rb.add_samples(DeviceType::Microphone, vec![MIC; 1200]);
+            rb.add_samples(DeviceType::System, vec![SYS; 1200]);
+            while rb.can_mix() {
+                if let Some(win) = rb.extract_window() {
+                    windows.push(win);
+                }
+            }
+        }
+
+        assert!(!windows.is_empty(), "expected mixed windows to be produced");
+
+        for (i, (mic_win, sys_win)) in windows.iter().enumerate() {
+            assert_eq!(mic_win.len(), w, "window {i}: bad mic length");
+            assert_eq!(sys_win.len(), w, "window {i}: bad sys length");
+            assert!(
+                mic_win.iter().all(|&s| s == MIC),
+                "window {i}: mic channel has injected silence (zero-padding) — picote"
+            );
+            assert!(
+                sys_win.iter().all(|&s| s == SYS),
+                "window {i}: sys channel has injected silence (zero-padding) — picote"
+            );
+        }
     }
 }
