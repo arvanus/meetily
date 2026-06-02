@@ -65,6 +65,59 @@ pub struct TranscriptionStatus {
 }
 
 // ============================================================================
+// HELPERS
+// ============================================================================
+
+/// Resolve the active transcription engine/model for persistence in transcripts.json.
+///
+/// Reads the configured provider and queries the currently loaded model from the
+/// matching global engine. Returns a normalized engine id ("whisper"/"parakeet")
+/// and the loaded model name when known.
+async fn resolve_transcription_info<R: Runtime>(app: &AppHandle<R>) -> (String, Option<String>) {
+    let provider = match crate::api::api::api_get_transcript_config(
+        app.clone(),
+        app.clone().state(),
+        None,
+    )
+    .await
+    {
+        Ok(Some(cfg)) => cfg.provider,
+        _ => "parakeet".to_string(),
+    };
+
+    let use_parakeet = provider == "parakeet";
+
+    let model = if use_parakeet {
+        let engine = {
+            let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        match engine {
+            Some(e) => e.get_current_model().await,
+            None => None,
+        }
+    } else {
+        let engine = {
+            let guard = crate::whisper_engine::commands::WHISPER_ENGINE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        match engine {
+            Some(e) => e.get_current_model().await,
+            None => None,
+        }
+    };
+
+    (
+        if use_parakeet { "parakeet" } else { "whisper" }.to_string(),
+        model,
+    )
+}
+
+// ============================================================================
 // RECORDING COMMANDS
 // ============================================================================
 
@@ -226,6 +279,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         )
     });
     manager.set_meeting_name(Some(effective_meeting_name));
+
+    // Record which engine/model is producing the transcription (for transcripts.json).
+    // Model is already loaded at this point (validated above).
+    let (tx_engine, tx_model) = resolve_transcription_info(&app).await;
+    manager.set_transcription_info(tx_engine, tx_model);
 
     // Set up error callback
     let app_for_error = app.clone();
@@ -425,6 +483,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         )
     });
     manager.set_meeting_name(Some(effective_meeting_name));
+
+    // Record which engine/model is producing the transcription (for transcripts.json).
+    // Model is already loaded at this point (validated above).
+    let (tx_engine, tx_model) = resolve_transcription_info(&app).await;
+    manager.set_transcription_info(tx_engine, tx_model);
 
     // Set up error callback
     let app_for_error = app.clone();

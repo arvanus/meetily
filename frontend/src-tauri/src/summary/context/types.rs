@@ -16,6 +16,8 @@ pub struct ContextAttachmentInfo {
 pub struct SummaryContextData {
     pub context_prompt: String,
     pub attachments: Vec<ContextAttachmentInfo>,
+    /// Persisted summary template selection, or None to use the UI default.
+    pub template_id: Option<String>,
 }
 
 /// Full attachment row as stored in `meeting_context_attachments`.

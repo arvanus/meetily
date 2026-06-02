@@ -43,6 +43,23 @@ pub async fn api_save_summary_context(
 }
 
 #[tauri::command]
+pub async fn api_save_summary_template(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    template_id: String,
+) -> Result<(), String> {
+    log_info!(
+        "api_save_summary_template for meeting_id: {} -> {}",
+        &meeting_id,
+        &template_id
+    );
+    let pool = state.db_manager.pool();
+    SummaryContextRepository::upsert_template(pool, &meeting_id, &template_id)
+        .await
+        .map_err(|e| format!("Failed to save template: {}", e))
+}
+
+#[tauri::command]
 pub async fn api_get_summary_context(
     state: tauri::State<'_, AppState>,
     meeting_id: String,
@@ -51,6 +68,9 @@ pub async fn api_get_summary_context(
     let context_prompt = SummaryContextRepository::get_prompt(pool, &meeting_id)
         .await
         .map_err(|e| format!("Failed to load context: {}", e))?;
+    let template_id = SummaryContextRepository::get_template(pool, &meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load template: {}", e))?;
     let rows = ContextAttachmentsRepository::list(pool, &meeting_id)
         .await
         .map_err(|e| format!("Failed to load attachments: {}", e))?;
@@ -58,6 +78,7 @@ pub async fn api_get_summary_context(
     Ok(SummaryContextData {
         context_prompt,
         attachments,
+        template_id,
     })
 }
 

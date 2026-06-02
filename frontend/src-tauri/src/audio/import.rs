@@ -648,7 +648,20 @@ async fn run_import<R: Runtime>(
     // Write transcripts.json and metadata.json to the meeting folder
     emit_progress(&app, "saving", 90, "Writing transcript files...");
 
-    if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
+    // Record which engine/model produced the transcription.
+    let model_used = if let Some(ref e) = whisper_engine {
+        e.get_current_model().await
+    } else if let Some(ref e) = parakeet_engine {
+        e.get_current_model().await
+    } else {
+        None
+    };
+    let transcription_info = super::common::TranscriptionInfo {
+        engine: if use_parakeet { "parakeet" } else { "whisper" }.to_string(),
+        model: model_used,
+    };
+
+    if let Err(e) = write_transcripts_json(&meeting_folder, &segments, Some(&transcription_info)) {
         warn!("Failed to write transcripts.json: {}", e);
     }
 
@@ -1194,7 +1207,11 @@ mod tests {
             },
         ];
 
-        let result = write_transcripts_json(dir.path(), &segments);
+        let info = super::super::common::TranscriptionInfo {
+            engine: "whisper".to_string(),
+            model: Some("small".to_string()),
+        };
+        let result = write_transcripts_json(dir.path(), &segments, Some(&info));
         assert!(result.is_ok(), "write_transcripts_json failed: {:?}", result);
 
         // Verify file exists and is valid JSON
@@ -1204,7 +1221,9 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["total_segments"], 2);
-        assert_eq!(parsed["version"], "1.0");
+        assert_eq!(parsed["version"], "1.1");
+        assert_eq!(parsed["transcription"]["engine"], "whisper");
+        assert_eq!(parsed["transcription"]["model"], "small");
         assert_eq!(parsed["segments"][0]["text"], "Hello world");
         assert_eq!(parsed["segments"][1]["text"], "Second segment");
         assert_eq!(parsed["segments"][0]["sequence_id"], 0);
@@ -1212,6 +1231,29 @@ mod tests {
 
         // Verify temp file was cleaned up
         assert!(!dir.path().join(".transcripts.json.tmp").exists());
+    }
+
+    #[test]
+    fn test_write_transcripts_json_without_transcription_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let segments = vec![TranscriptSegment {
+            id: "t-1".to_string(),
+            text: "Hello".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            audio_start_time: Some(0.0),
+            audio_end_time: Some(1.0),
+            duration: Some(1.0),
+            source: None,
+        }];
+
+        let result = write_transcripts_json(dir.path(), &segments, None);
+        assert!(result.is_ok(), "write_transcripts_json failed: {:?}", result);
+
+        let content =
+            std::fs::read_to_string(dir.path().join("transcripts.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // Absent when unknown — never serialized as null.
+        assert!(parsed.get("transcription").is_none());
     }
 
     #[test]

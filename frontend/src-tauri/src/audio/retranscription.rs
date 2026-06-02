@@ -488,7 +488,20 @@ async fn run_retranscription<R: Runtime>(
     // Write updated transcripts.json and metadata.json to the meeting folder
     emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
 
-    if let Err(e) = write_transcripts_json(&folder_path, &segments) {
+    // Record which engine/model produced the transcription.
+    let model_used = if let Some(ref e) = whisper_engine {
+        e.get_current_model().await
+    } else if let Some(ref e) = parakeet_engine {
+        e.get_current_model().await
+    } else {
+        None
+    };
+    let transcription_info = super::common::TranscriptionInfo {
+        engine: if use_parakeet { "parakeet" } else { "whisper" }.to_string(),
+        model: model_used,
+    };
+
+    if let Err(e) = write_transcripts_json(&folder_path, &segments, Some(&transcription_info)) {
         warn!("Failed to write transcripts.json: {}", e);
     }
 

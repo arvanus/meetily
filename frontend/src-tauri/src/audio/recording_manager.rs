@@ -441,6 +441,11 @@ impl RecordingManager {
         self.recording_saver.set_meeting_name(name);
     }
 
+    /// Record which engine/model is producing this recording's transcription.
+    pub fn set_transcription_info(&self, engine: String, model: Option<String>) {
+        self.recording_saver.set_transcription_info(engine, model);
+    }
+
     /// Add a structured transcript segment to be saved later
     pub fn add_transcript_segment(&self, segment: super::recording_saver::TranscriptSegment) {
         self.recording_saver.add_transcript_segment(segment);

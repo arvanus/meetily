@@ -63,6 +63,8 @@ pub struct RecordingSaver {
     chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
     channels: u16,
+    /// Engine/model used for this recording's live transcription (for transcripts.json).
+    transcription_info: Arc<Mutex<Option<super::common::TranscriptionInfo>>>,
 }
 
 impl RecordingSaver {
@@ -76,12 +78,21 @@ impl RecordingSaver {
             chunk_receiver: None,
             is_saving: Arc::new(Mutex::new(false)),
             channels: 1,
+            transcription_info: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.meeting_name = name;
+    }
+
+    /// Record which engine/model is producing this recording's transcription.
+    /// Persisted at the top of transcripts.json.
+    pub fn set_transcription_info(&self, engine: String, model: Option<String>) {
+        if let Ok(mut info) = self.transcription_info.lock() {
+            *info = Some(super::common::TranscriptionInfo { engine, model });
+        }
     }
 
     /// Set device information in metadata
@@ -310,16 +321,34 @@ impl RecordingSaver {
         let transcript_path = folder.join("transcripts.json");
         let temp_path = folder.join(".transcripts.json.tmp");
 
-        // Create JSON structure
-        let json = serde_json::json!({
-            "version": "1.0",
-            "segments": segments_clone,
-            "last_updated": chrono::Utc::now().to_rfc3339(),
-            "total_segments": segments_clone.len()
-        });
+        // Snapshot the engine/model info (may be None if set after the first segment).
+        let transcription_info = self
+            .transcription_info
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+
+        // Typed root so field order is preserved (transcription sits near the top).
+        #[derive(Serialize)]
+        struct TranscriptsFile<'a> {
+            version: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            transcription: Option<super::common::TranscriptionInfo>,
+            last_updated: String,
+            total_segments: usize,
+            segments: &'a [TranscriptSegment],
+        }
+
+        let file = TranscriptsFile {
+            version: "1.1",
+            transcription: transcription_info,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+            total_segments: segments_clone.len(),
+            segments: &segments_clone,
+        };
 
         // Serialize to pretty JSON string
-        let json_string = serde_json::to_string_pretty(&json)
+        let json_string = serde_json::to_string_pretty(&file)
             .map_err(|e| {
                 error!("Failed to serialize transcripts to JSON: {}", e);
                 anyhow::anyhow!("JSON serialization failed: {}", e)

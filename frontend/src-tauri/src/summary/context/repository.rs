@@ -41,6 +41,44 @@ impl SummaryContextRepository {
         .await?;
         Ok(())
     }
+
+    /// Returns the persisted template_id for a meeting, or None if no row exists
+    /// or no template was saved.
+    pub async fn get_template(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT template_id FROM meeting_summary_context WHERE meeting_id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.and_then(|(t,)| t))
+    }
+
+    /// Upsert the template_id for a meeting without touching context_prompt
+    /// (which keeps its column default on insert).
+    pub async fn upsert_template(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        template_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"INSERT INTO meeting_summary_context (meeting_id, template_id, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(meeting_id) DO UPDATE SET
+                 template_id = excluded.template_id,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(meeting_id)
+        .bind(template_id)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
 }
 
 pub struct ContextAttachmentsRepository;
@@ -214,6 +252,49 @@ mod tests {
         SummaryContextRepository::upsert_prompt(&pool, "m1", "Second").await.unwrap();
         let s = SummaryContextRepository::get_prompt(&pool, "m1").await.unwrap();
         assert_eq!(s, "Second");
+    }
+
+    #[tokio::test]
+    async fn get_template_returns_none_when_no_row() {
+        let pool = setup_pool().await;
+        let t = SummaryContextRepository::get_template(&pool, "m1").await.unwrap();
+        assert_eq!(t, None);
+    }
+
+    #[tokio::test]
+    async fn upsert_then_get_template_returns_value() {
+        let pool = setup_pool().await;
+        SummaryContextRepository::upsert_template(&pool, "m1", "daily_standup")
+            .await
+            .unwrap();
+        let t = SummaryContextRepository::get_template(&pool, "m1").await.unwrap();
+        assert_eq!(t, Some("daily_standup".to_string()));
+    }
+
+    #[tokio::test]
+    async fn template_and_prompt_are_independent() {
+        let pool = setup_pool().await;
+        // Save a template first (row created without an explicit prompt).
+        SummaryContextRepository::upsert_template(&pool, "m1", "standard_meeting")
+            .await
+            .unwrap();
+        // Prompt defaults to empty string, template preserved.
+        assert_eq!(
+            SummaryContextRepository::get_prompt(&pool, "m1").await.unwrap(),
+            ""
+        );
+        // Now save a prompt; template must survive.
+        SummaryContextRepository::upsert_prompt(&pool, "m1", "Hello")
+            .await
+            .unwrap();
+        assert_eq!(
+            SummaryContextRepository::get_prompt(&pool, "m1").await.unwrap(),
+            "Hello"
+        );
+        assert_eq!(
+            SummaryContextRepository::get_template(&pool, "m1").await.unwrap(),
+            Some("standard_meeting".to_string())
+        );
     }
 
     #[tokio::test]

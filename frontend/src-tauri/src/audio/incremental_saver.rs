@@ -447,6 +447,7 @@ mod tests {
                 timestamp: i as f64 * 0.5,  // timestamp in seconds
                 chunk_id: i as u64,
                 device_type: DeviceType::Microphone,
+                is_partial: false,
             };
             saver.add_chunk(chunk).unwrap();
         }
@@ -505,6 +506,7 @@ mod tests {
                 timestamp: i as f64 * 0.5,
                 chunk_id: i as u64,
                 device_type: DeviceType::Microphone,
+                is_partial: false,
             };
             saver.add_chunk(chunk).unwrap();
         }
@@ -537,6 +539,7 @@ mod tests {
                 timestamp: i as f64 * 0.5,
                 chunk_id: i as u64,
                 device_type: DeviceType::Microphone,
+                is_partial: false,
             };
             saver.add_chunk(chunk).unwrap();
         }

@@ -1,8 +1,21 @@
 use crate::api::TranscriptSegment;
 use anyhow::Result;
 use log::{debug, info};
+use serde::Serialize;
+use serde_json::Value;
 use std::path::Path;
 use uuid::Uuid;
+
+/// Which engine/model produced a meeting's transcription.
+/// Persisted once at the top of `transcripts.json` for inspection/auditing.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TranscriptionInfo {
+    /// Normalized engine identifier: "whisper" or "parakeet".
+    pub engine: String,
+    /// Loaded model name, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
 
 /// Unload the transcription engine after a batch job (import or retranscription).
 /// Skips unloading if a live recording is currently in progress, since recording
@@ -58,16 +71,34 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64, Optio
         .collect()
 }
 
-/// Write transcripts.json to a meeting folder (atomic write with temp file)
-pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegment]) -> Result<()> {
+/// Write transcripts.json to a meeting folder (atomic write with temp file).
+///
+/// `transcription` records which engine/model produced the text. When present it
+/// is serialized right after `version` so it sits at the top of the file. The
+/// root is a typed struct so field order is preserved regardless of serde_json's
+/// map ordering.
+pub(crate) fn write_transcripts_json(
+    folder: &Path,
+    segments: &[TranscriptSegment],
+    transcription: Option<&TranscriptionInfo>,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct TranscriptsFile<'a> {
+        version: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transcription: Option<&'a TranscriptionInfo>,
+        last_updated: String,
+        total_segments: usize,
+        segments: Vec<Value>,
+    }
+
     let transcript_path = folder.join("transcripts.json");
     let temp_path = folder.join(".transcripts.json.tmp");
 
-    let json = serde_json::json!({
-        "version": "1.0",
-        "last_updated": chrono::Utc::now().to_rfc3339(),
-        "total_segments": segments.len(),
-        "segments": segments.iter().enumerate().map(|(i, s)| {
+    let segments_json = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
             let mut seg = serde_json::json!({
                 "id": s.id,
                 "text": s.text,
@@ -81,10 +112,18 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
                 seg["source"] = serde_json::json!(source);
             }
             seg
-        }).collect::<Vec<_>>()
-    });
+        })
+        .collect::<Vec<_>>();
 
-    let json_string = serde_json::to_string_pretty(&json)?;
+    let file = TranscriptsFile {
+        version: "1.1",
+        transcription,
+        last_updated: chrono::Utc::now().to_rfc3339(),
+        total_segments: segments.len(),
+        segments: segments_json,
+    };
+
+    let json_string = serde_json::to_string_pretty(&file)?;
     std::fs::write(&temp_path, &json_string)?;
     std::fs::rename(&temp_path, &transcript_path)?;
 
