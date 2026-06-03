@@ -9,6 +9,9 @@ export interface AudioFileInfo {
   duration_seconds: number;
   size_bytes: number;
   format: string;
+  /** File creation date (RFC3339, UTC). Null when the OS doesn't expose it,
+   *  in which case the user must enter the meeting date manually. */
+  created_at: string | null;
 }
 
 export interface ImportProgress {
@@ -49,7 +52,8 @@ export interface UseImportAudioReturn {
     title: string,
     language?: string | null,
     model?: string | null,
-    provider?: string | null
+    provider?: string | null,
+    meetingDatetime?: string | null
   ) => Promise<void>;
   cancelImport: () => Promise<void>;
   reset: () => void;
@@ -198,7 +202,8 @@ export function useImportAudio({
       title: string,
       language?: string | null,
       model?: string | null,
-      provider?: string | null
+      provider?: string | null,
+      meetingDatetime?: string | null
     ) => {
       isCancelledRef.current = false;
       setStatus('processing');
@@ -222,6 +227,7 @@ export function useImportAudio({
           language: language || null,
           model: model || null,
           provider: provider || null,
+          meetingDatetime: meetingDatetime || null,
         });
       } catch (err: any) {
         setStatus('error');

@@ -18,7 +18,9 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{create_transcript_segments_at, split_segment_at_silence, write_transcripts_json};
+#[cfg(test)]
+use super::common::create_transcript_segments;
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -68,6 +70,10 @@ pub struct AudioFileInfo {
     pub duration_seconds: f64,
     pub size_bytes: u64,
     pub format: String,
+    /// File creation date (RFC3339, UTC). `None` when the OS/filesystem does
+    /// not expose a creation time, in which case the UI must ask the user for
+    /// the meeting date before importing.
+    pub created_at: Option<String>,
 }
 
 /// Progress update emitted during import
@@ -144,6 +150,15 @@ pub fn validate_audio_file(path: &Path) -> Result<AudioFileInfo> {
         .map_err(|e| anyhow!("Cannot read file: {}", e))?;
     let size_bytes = metadata.len();
 
+    // Capture the file's creation date so the import can preserve the original
+    // recording date instead of using the system time. Not all platforms/
+    // filesystems expose a creation time (e.g. some Linux setups); on those the
+    // UI prompts the user for the date.
+    let created_at = metadata
+        .created()
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+
     // Check file size limit
     if size_bytes > MAX_FILE_SIZE_BYTES {
         return Err(anyhow!(
@@ -186,6 +201,7 @@ pub fn validate_audio_file(path: &Path) -> Result<AudioFileInfo> {
         duration_seconds,
         size_bytes,
         format: extension.to_uppercase(),
+        created_at,
     })
 }
 
@@ -258,6 +274,7 @@ pub async fn start_import<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    meeting_datetime: Option<String>,
 ) -> Result<ImportResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
@@ -273,6 +290,7 @@ pub async fn start_import<R: Runtime>(
         language,
         model,
         provider,
+        meeting_datetime,
     )
     .await;
 
@@ -315,8 +333,18 @@ async fn run_import<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    meeting_datetime: Option<String>,
 ) -> Result<ImportResult> {
     let source = PathBuf::from(&source_path);
+
+    // Resolve the meeting date/time. The frontend sends the file's creation date
+    // (or a value the user entered when the OS couldn't provide one). Anything
+    // unparseable falls back to the current system time.
+    let meeting_time: chrono::DateTime<chrono::Utc> = meeting_datetime
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
 
     // Validate source file
     if !source.exists() {
@@ -340,7 +368,7 @@ async fn run_import<R: Runtime>(
 
     // Create meeting folder
     let base_folder = get_default_recordings_folder();
-    let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
+    let meeting_folder = create_meeting_folder(&base_folder, &title, false, Some(meeting_time))?;
 
     // Copy audio file to meeting folder
     emit_progress(&app, "copying", 10, "Copying audio file...");
@@ -629,8 +657,9 @@ async fn run_import<R: Runtime>(
 
     emit_progress(&app, "saving", 85, "Creating meeting...");
 
-    // Create transcript segments
-    let segments = create_transcript_segments(&all_transcripts);
+    // Create transcript segments, anchored to the meeting date so each
+    // segment's timestamp reflects when it was recorded (date + audio offset).
+    let segments = create_transcript_segments_at(&all_transcripts, Some(meeting_time));
 
     // Save to database
     let app_state = app
@@ -642,6 +671,7 @@ async fn run_import<R: Runtime>(
         &title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
+        meeting_time,
     )
     .await?;
 
@@ -672,6 +702,7 @@ async fn run_import<R: Runtime>(
         duration_seconds,
         &dest_filename,
         "import",
+        meeting_time,
     ) {
         warn!("Failed to write metadata.json: {}", e);
     }
@@ -705,9 +736,10 @@ async fn create_meeting_with_transcripts(
     title: &str,
     segments: &[TranscriptSegment],
     folder_path: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let meeting_id = format!("meeting-{}", Uuid::new_v4());
-    let now = chrono::Utc::now();
+    let now = created_at;
 
     // Start transaction
     let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
@@ -896,10 +928,11 @@ fn write_import_metadata(
     duration_seconds: f64,
     audio_filename: &str,
     source: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let metadata_path = folder.join("metadata.json");
     let temp_path = folder.join(".metadata.json.tmp");
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = created_at.to_rfc3339();
 
     let json = serde_json::json!({
         "version": "1.0",
@@ -981,6 +1014,7 @@ pub async fn start_import_audio_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    meeting_datetime: Option<String>,
 ) -> Result<ImportStarted, String> {
     // Check if import is already in progress (guard will be acquired in start_import)
     if IMPORT_IN_PROGRESS.load(Ordering::SeqCst) {
@@ -989,7 +1023,7 @@ pub async fn start_import_audio_command<R: Runtime>(
 
     // Spawn import in background
     tauri::async_runtime::spawn(async move {
-        let result = start_import(app, source_path, title, language, model, provider).await;
+        let result = start_import(app, source_path, title, language, model, provider, meeting_datetime).await;
 
         if let Err(e) = result {
             error!("Import failed: {}", e);
@@ -1267,6 +1301,7 @@ mod tests {
             1800.0,
             "audio.mp4",
             "import",
+            chrono::Utc::now(),
         );
         assert!(result.is_ok(), "write_import_metadata failed: {:?}", result);
 

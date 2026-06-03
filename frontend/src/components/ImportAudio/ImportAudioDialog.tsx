@@ -64,6 +64,15 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+// Convert a UTC RFC3339 string into the value format expected by a
+// <input type="datetime-local"> ("YYYY-MM-DDTHH:mm"), in local time.
+function isoToLocalInput(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 export function ImportAudioDialog({
   open,
   onOpenChange,
@@ -78,6 +87,9 @@ export function ImportAudioDialog({
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [titleModifiedByUser, setTitleModifiedByUser] = useState(false);
+  // Meeting date/time (local "YYYY-MM-DDTHH:mm"). Pre-filled from the file's
+  // creation date; required (and empty) when the OS doesn't expose one.
+  const [meetingDateTime, setMeetingDateTime] = useState('');
 
   // Always start as false — represents "dialog has not yet been opened".
   // Do NOT initialize from the `open` prop: if the component mounts with open=true
@@ -139,6 +151,7 @@ export function ImportAudioDialog({
       setTitleModifiedByUser(false);
       setSelectedLang(selectedLanguage || 'auto');
       setShowAdvanced(false);
+      setMeetingDateTime('');
 
       // Validate preselected file if provided
       if (preselectedFile) {
@@ -160,6 +173,14 @@ export function ImportAudioDialog({
       setTitle(fileInfo.filename);
     }
   }, [fileInfo, title, titleModifiedByUser]);
+
+  // Pre-fill the meeting date/time from the file's creation date whenever a new
+  // file is selected. Empty when the OS didn't provide it (user must fill in).
+  useEffect(() => {
+    if (fileInfo) {
+      setMeetingDateTime(fileInfo.created_at ? isoToLocalInput(fileInfo.created_at) : '');
+    }
+  }, [fileInfo]);
 
   const selectedModel = useMemo((): ModelOption | undefined => {
     if (!selectedModelKey) return undefined;
@@ -185,14 +206,18 @@ export function ImportAudioDialog({
   };
 
   const handleStartImport = async () => {
-    if (!fileInfo) return;
+    if (!fileInfo || !meetingDateTime) return;
+
+    // datetime-local value is local time; convert to UTC RFC3339 for the backend.
+    const meetingIso = new Date(meetingDateTime).toISOString();
 
     await startImport(
       fileInfo.path,
       title || fileInfo.filename,
       isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang,
       selectedModel?.name || null,
-      selectedModel?.provider || null
+      selectedModel?.provider || null,
+      meetingIso
     );
   };
 
@@ -299,6 +324,26 @@ export function ImportAudioDialog({
                       }}
                       placeholder="Enter meeting title"
                     />
+                  </div>
+
+                  {/* Meeting date/time (defaults to the file's creation date) */}
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Meeting Date &amp; Time</label>
+                    <Input
+                      type="datetime-local"
+                      value={meetingDateTime}
+                      onChange={(e) => setMeetingDateTime(e.target.value)}
+                    />
+                    {fileInfo.created_at ? (
+                      <p className="text-xs text-gray-500">
+                        Taken from the file&apos;s creation date. Edit if needed.
+                      </p>
+                    ) : (
+                      <p className="text-xs text-amber-600 flex items-center gap-1">
+                        <AlertCircle className="h-3.5 w-3.5" />
+                        The file&apos;s date couldn&apos;t be read. Please enter the meeting date.
+                      </p>
+                    )}
                   </div>
 
                   <Button variant="outline" size="sm" onClick={handleSelectFile} className="w-full">
@@ -445,7 +490,7 @@ export function ImportAudioDialog({
               <Button
                 onClick={handleStartImport}
                 className="bg-blue-600 hover:bg-blue-700"
-                disabled={!fileInfo}
+                disabled={!fileInfo || !meetingDateTime}
               >
                 <Upload className="h-4 w-4 mr-2" />
                 Import

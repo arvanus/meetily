@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use realfft::num_complex::{Complex32, ComplexFloat};
 use realfft::RealFftPlanner;
@@ -32,12 +32,18 @@ pub fn sanitize_filename(name: &str) -> String {
 /// * `base_path` - Base directory for meetings
 /// * `meeting_name` - Name of the meeting
 /// * `create_checkpoints_dir` - Whether to create .checkpoints/ subdirectory (only needed when auto_save is true)
+/// * `folder_time` - Date/time used to name the folder. `None` falls back to the
+///   current system time (live recording); imports pass the source file's date.
 pub fn create_meeting_folder(
     base_path: &PathBuf,
     meeting_name: &str,
     create_checkpoints_dir: bool,
+    folder_time: Option<DateTime<Utc>>,
 ) -> Result<PathBuf> {
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M").to_string();
+    let timestamp = folder_time
+        .unwrap_or_else(Utc::now)
+        .format("%Y-%m-%d_%H-%M")
+        .to_string();
     let sanitized_name = sanitize_filename(meeting_name);
     let folder_name = format!("{}_{}", sanitized_name, timestamp);
     let meeting_folder = base_path.join(folder_name);
