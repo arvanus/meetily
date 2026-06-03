@@ -1,5 +1,7 @@
+use crate::cli::args::RecordArgs;
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 /// Constrói um app Tauri SEM janela. Reusa os mesmos State do app para que os
@@ -145,6 +147,151 @@ pub async fn run_list_models(app: &tauri::AppHandle) -> Result<(), String> {
         Ok(_) => println!("  (nenhum)"),
         Err(e) => println!("  (erro: {})", e),
     }
+
+    Ok(())
+}
+
+/// Aguarda Ctrl+C ou, se `duration` for informado, o tempo máximo em segundos.
+async fn wait_for_stop(duration: Option<u64>) {
+    match duration {
+        Some(secs) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {},
+            }
+        }
+        None => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Grava uma reunião no modo NORMAL (com IA): reusa o pipeline do app (mixagem +
+/// VAD + transcrição), imprime as linhas finalizadas ao vivo no terminal e, ao
+/// parar (Ctrl+C ou --duration), persiste a reunião no banco igual ao app.
+pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), String> {
+    args.validate()?;
+
+    // Nome efetivo controlado pela CLI: usamos para o título da gravação E para a
+    // persistência no banco, garantindo que ambos batam.
+    let effective_name = match args.name.clone() {
+        Some(n) => n,
+        None => format!(
+            "CLI Meeting {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ),
+    };
+
+    // Acumulador de segmentos finalizados (apenas para impressão + salvar no banco).
+    // O listener interno do app continua cuidando do transcripts.json em disco.
+    let segments: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Registra um listener próprio da CLI no evento transcript-update (somente finais).
+    let listener_id = {
+        use tauri::Listener;
+        let segments = segments.clone();
+        let quiet = args.quiet;
+        app.listen("transcript-update", move |event: tauri::Event| {
+            if let Ok(u) = serde_json::from_str::<
+                crate::audio::recording_commands::TranscriptUpdate,
+            >(event.payload())
+            {
+                if !quiet {
+                    println!("[{}] {}", u.timestamp, u.text);
+                }
+                // O formato esperado por api_save_transcript é o
+                // crate::api::api::TranscriptSegment (campos obrigatórios:
+                // id, text, timestamp; opcionais: audio_start_time, audio_end_time,
+                // duration, source). NÃO é o recording_saver::TranscriptSegment.
+                let seg = serde_json::json!({
+                    "id": format!("seg_{}", u.sequence_id),
+                    "text": u.text,
+                    "timestamp": u.timestamp,
+                    "audio_start_time": u.audio_start_time,
+                    "audio_end_time": u.audio_end_time,
+                    "duration": u.duration,
+                    "source": u.source,
+                });
+                if let Ok(mut guard) = segments.lock() {
+                    guard.push(seg);
+                }
+            }
+        })
+    };
+
+    // Inicia a gravação reusando o pipeline do app.
+    if let Err(e) = crate::audio::recording_commands::start_recording_with_meeting_name(
+        app.clone(),
+        Some(effective_name.clone()),
+    )
+    .await
+    {
+        // Remove o listener antes de retornar.
+        {
+            use tauri::Listener;
+            app.unlisten(listener_id);
+        }
+        eprintln!(
+            "Modelo não disponível. Baixe pelo app, ou grave sem IA com --record-only."
+        );
+        return Err(e);
+    }
+
+    // Captura o caminho da pasta da reunião AGORA: stop_recording faz take() do
+    // RECORDING_MANAGER e não o devolve, então depois do stop a pasta fica indisponível.
+    let folder_path = crate::audio::recording_commands::get_meeting_folder_path()
+        .await
+        .ok()
+        .flatten();
+
+    println!("Gravando. Ctrl+C para parar e salvar.");
+
+    // Aguarda Ctrl+C ou o tempo de --duration.
+    wait_for_stop(args.duration).await;
+
+    println!("Parando e salvando...");
+
+    // Para a gravação (force-flush + espera workers + grava arquivos finais).
+    let stop_args = crate::audio::recording_commands::RecordingArgs {
+        save_path: folder_path.clone().unwrap_or_default(),
+    };
+    if let Err(e) =
+        crate::audio::recording_commands::stop_recording(app.clone(), stop_args).await
+    {
+        use tauri::Listener;
+        app.unlisten(listener_id);
+        return Err(format!("Falha ao parar a gravação: {}", e));
+    }
+
+    // Remove o listener da CLI.
+    {
+        use tauri::Listener;
+        app.unlisten(listener_id);
+    }
+
+    // Coleta os segmentos acumulados.
+    let segments_vec: Vec<serde_json::Value> = match segments.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => Vec::new(),
+    };
+
+    // Persiste no banco EXATAMENTE como o app (cria a reunião e retorna meeting_id).
+    let result = crate::api::api::api_save_transcript(
+        app.clone(),
+        app.state::<AppState>(),
+        effective_name.clone(),
+        segments_vec,
+        folder_path.clone(),
+        None,
+    )
+    .await?;
+
+    let meeting_id = result
+        .get("meeting_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let folder_display = folder_path.unwrap_or_else(|| "(sem pasta)".to_string());
+    println!("✓ Salvo. meeting_id={} pasta={}", meeting_id, folder_display);
 
     Ok(())
 }

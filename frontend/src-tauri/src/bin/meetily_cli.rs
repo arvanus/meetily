@@ -27,6 +27,11 @@ fn main() {
             tauri::async_runtime::block_on(runner::run_list_models(&handle))
                 .unwrap_or_else(|e| eprintln!("erro: {e}"));
         }
-        Command::Record(_args) => println!("(record: implementado na Task 3)"),
+        Command::Record(args) => {
+            if let Err(e) = tauri::async_runtime::block_on(runner::run_record(&handle, args)) {
+                eprintln!("erro: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
