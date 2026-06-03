@@ -1,6 +1,7 @@
 use crate::cli::args::RecordArgs;
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -186,18 +187,53 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // O listener interno do app continua cuidando do transcripts.json em disco.
     let segments: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Rótulo engine/model para o painel: reusa a config padrão do banco (igual à
+    // Task 2). Se falhar, mostra "?".
+    let engine_model = match crate::api::api::api_get_transcript_config(
+        app.clone(),
+        app.state::<AppState>(),
+        None,
+    )
+    .await
+    {
+        Ok(Some(c)) => {
+            let provider = match c.provider.as_str() {
+                "localWhisper" => "whisper".to_string(),
+                other => other.to_string(),
+            };
+            format!("{}/{}", provider, c.model)
+        }
+        _ => "?".to_string(),
+    };
+
+    // Estado compartilhado do painel vivo (alimentado por audio-levels + contadores).
+    let panel = Arc::new(Mutex::new(crate::cli::panel::PanelState {
+        engine_model,
+        record_only: args.record_only,
+        ..Default::default()
+    }));
+
     // Registra um listener próprio da CLI no evento transcript-update (somente finais).
     let listener_id = {
         use tauri::Listener;
         let segments = segments.clone();
+        let panel = panel.clone();
         let quiet = args.quiet;
         app.listen("transcript-update", move |event: tauri::Event| {
             if let Ok(u) = serde_json::from_str::<
                 crate::audio::recording_commands::TranscriptUpdate,
             >(event.payload())
             {
+                // Conta o trecho para o painel.
+                if let Ok(mut p) = panel.lock() {
+                    p.segments += 1;
+                }
                 if !quiet {
-                    println!("[{}] {}", u.timestamp, u.text);
+                    // Limpa a linha de status ANTES de rolar a linha do transcript,
+                    // para que painel e texto não se sobreponham; a draw task
+                    // repinta o painel no próximo tick.
+                    print!("\r\x1b[K[{}] {}\n", u.timestamp, u.text);
+                    let _ = std::io::stdout().flush();
                 }
                 // O formato esperado por api_save_transcript é o
                 // crate::api::api::TranscriptSegment (campos obrigatórios:
@@ -219,6 +255,26 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         })
     };
 
+    // Listener de níveis de áudio (a cada ~50ms) → alimenta o VU/equalizador do painel.
+    let levels_listener_id = {
+        use tauri::Listener;
+        let panel = panel.clone();
+        app.listen("audio-levels", move |e: tauri::Event| {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(e.payload()) {
+                if let Ok(mut p) = panel.lock() {
+                    p.mic_rms = v["mic_rms"].as_f64().unwrap_or(0.0) as f32;
+                    p.system_rms = v["system_rms"].as_f64().unwrap_or(0.0) as f32;
+                    if let Some(b) = v["bands"].as_array() {
+                        for i in 0..3 {
+                            p.bands[i] =
+                                b.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     // Inicia a gravação reusando o pipeline do app.
     if let Err(e) = crate::audio::recording_commands::start_recording_with_meeting_name(
         app.clone(),
@@ -226,10 +282,11 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     )
     .await
     {
-        // Remove o listener antes de retornar.
+        // Remove os listeners antes de retornar.
         {
             use tauri::Listener;
             app.unlisten(listener_id);
+            app.unlisten(levels_listener_id);
         }
         eprintln!(
             "Modelo não disponível. Baixe pelo app, ou grave sem IA com --record-only."
@@ -246,8 +303,44 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
 
     println!("Gravando. Ctrl+C para parar e salvar.");
 
+    // Draw task do painel vivo: redesenha ~4x/s na própria linha, sempre (mesmo com
+    // --quiet; quiet só esconde o texto dos transcripts). Toggla o ponto a cada ~1s e
+    // rastreia silêncio (mic+sis abaixo de 0.01) para o alerta.
+    let draw_handle = {
+        let panel = panel.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut silent_accum_ms: u64 = 0;
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                let line = {
+                    let Ok(mut p) = panel.lock() else { continue };
+                    let elapsed = started.elapsed().as_secs();
+                    p.elapsed_secs = elapsed;
+                    p.pulse_on = (elapsed % 2) == 0;
+                    // Silêncio: acumula 250ms por tick quando ambos rms < 0.01.
+                    if p.mic_rms < 0.01 && p.system_rms < 0.01 {
+                        silent_accum_ms = silent_accum_ms.saturating_add(250);
+                    } else {
+                        silent_accum_ms = 0;
+                    }
+                    p.silent_secs = silent_accum_ms / 1000;
+                    crate::cli::panel::render(&p)
+                };
+                print!("\r\x1b[K{}", line);
+                let _ = std::io::stdout().flush();
+            }
+        })
+    };
+
     // Aguarda Ctrl+C ou o tempo de --duration.
     wait_for_stop(args.duration).await;
+
+    // Para a draw task e abre uma nova linha para o que vem a seguir.
+    draw_handle.abort();
+    println!();
 
     println!("Parando e salvando...");
 
@@ -260,13 +353,15 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     {
         use tauri::Listener;
         app.unlisten(listener_id);
+        app.unlisten(levels_listener_id);
         return Err(format!("Falha ao parar a gravação: {}", e));
     }
 
-    // Remove o listener da CLI.
+    // Remove os listeners da CLI.
     {
         use tauri::Listener;
         app.unlisten(listener_id);
+        app.unlisten(levels_listener_id);
     }
 
     // Coleta os segmentos acumulados.
