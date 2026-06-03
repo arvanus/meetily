@@ -400,6 +400,244 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     Ok(())
 }
 
+/// Start recording in RECORD-ONLY mode (no AI / no transcription).
+///
+/// Mirrors `start_recording_with_meeting_name` for device/preference/mode
+/// resolution so device selection matches the normal path, but with these
+/// intentional differences (record without AI, re-transcribe later in the app):
+///   - DIFF: NO transcription-model validation gate (a missing model must not
+///     block record-only).
+///   - DIFF: `auto_save` is FORCED to true (the audio file is the source for the
+///     later re-transcription), regardless of prefs.
+///   - DIFF: `set_transcription_info(None, None)` — no engine/model in transcripts.json.
+///   - DIFF: the `transcription_receiver` is dropped (no transcription task, no
+///     internal `transcript-update` listener).
+///   - KEEP: the audio-levels emit loop (panel needs mic/system RMS + FFT bands).
+pub async fn start_recording_only<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_name: Option<String>,
+) -> Result<(), String> {
+    info!(
+        "Starting RECORD-ONLY recording (no AI), meeting: {:?}",
+        meeting_name
+    );
+
+    // Check if already recording
+    let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
+    info!("🔍 IS_RECORDING state check: {}", current_recording_state);
+    if current_recording_state {
+        return Err("Recording already in progress".to_string());
+    }
+
+    // DIFF vs normal path: NO transcription-model validation here — record-only
+    // never loads AI, so a missing/downloading model must not block recording.
+
+    info!("🚀 Starting async record-only initialization (no AI)");
+
+    // Create new recording manager
+    let mut manager = RecordingManager::new();
+
+    // Load recording preferences to get device preferences AND recording mode.
+    // NOTE: prefs.auto_save is intentionally ignored below (forced true).
+    let (_prefs_auto_save, preferred_mic_name, preferred_system_name, recording_mode) =
+        match super::recording_preferences::load_recording_preferences(&app).await {
+            Ok(prefs) => {
+                info!("📋 Loaded recording preferences (record-only): recording_mode={:?}, preferred_mic={:?}, preferred_system={:?}",
+                      prefs.recording_mode, prefs.preferred_mic_device, prefs.preferred_system_device);
+                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device, prefs.recording_mode)
+            }
+            Err(e) => {
+                warn!("Failed to load recording preferences, using defaults: {}", e);
+                (true, None, None, super::recording_preferences::RecordingMode::Mono)
+            }
+        };
+
+    // DIFF vs normal path: force auto_save=true (the saved audio IS the source
+    // for re-transcription later in the app).
+    let auto_save = true;
+
+    // ========================================================================
+    // MICROPHONE DEVICE RESOLUTION: Preference → Default → Error
+    // (identical to start_recording_with_meeting_name)
+    // ========================================================================
+    let microphone_device = match preferred_mic_name {
+        Some(pref_name) => {
+            info!("🎤 Attempting to use preferred microphone: '{}'", pref_name);
+            match parse_audio_device(&pref_name) {
+                Ok(device) => {
+                    info!("✅ Using preferred microphone: '{}'", device.name);
+                    Some(Arc::new(device))
+                }
+                Err(e) => {
+                    warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
+                    warn!("   Falling back to system default microphone...");
+                    match default_input_device() {
+                        Ok(device) => {
+                            info!("✅ Using default microphone: '{}'", device.name);
+                            Some(Arc::new(device))
+                        }
+                        Err(default_err) => {
+                            error!("❌ No microphone available (preferred and default both failed)");
+                            return Err(format!(
+                                "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
+                                pref_name, default_err
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            info!("🎤 No microphone preference set, using system default");
+            match default_input_device() {
+                Ok(device) => {
+                    info!("✅ Using default microphone: '{}'", device.name);
+                    Some(Arc::new(device))
+                }
+                Err(e) => {
+                    error!("❌ No default microphone available");
+                    return Err(format!("No microphone device available: {}", e));
+                }
+            }
+        }
+    };
+
+    // ========================================================================
+    // SYSTEM AUDIO DEVICE RESOLUTION: Preference → Default → None (optional)
+    // (identical to start_recording_with_meeting_name)
+    // ========================================================================
+    let system_device = match preferred_system_name {
+        Some(pref_name) => {
+            info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
+            match parse_audio_device(&pref_name) {
+                Ok(device) => {
+                    info!("✅ Using preferred system audio: '{}'", device.name);
+                    Some(Arc::new(device))
+                }
+                Err(e) => {
+                    warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
+                    warn!("   Falling back to system default...");
+                    match default_output_device() {
+                        Ok(device) => {
+                            info!("✅ Using default system audio: '{}'", device.name);
+                            Some(Arc::new(device))
+                        }
+                        Err(default_err) => {
+                            warn!("⚠️ No system audio available (preferred and default both failed): {}", default_err);
+                            warn!("   Recording will continue with microphone only");
+                            None // System audio is optional
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            info!("🔊 No system audio preference set, using system default");
+            match default_output_device() {
+                Ok(device) => {
+                    info!("✅ Using default system audio: '{}'", device.name);
+                    Some(Arc::new(device))
+                }
+                Err(e) => {
+                    warn!("⚠️ No default system audio available: {}", e);
+                    warn!("   Recording will continue with microphone only");
+                    None // System audio is optional
+                }
+            }
+        }
+    };
+
+    // Always ensure a meeting name is set so incremental saver initializes
+    let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
+        let now = chrono::Local::now();
+        format!("Meeting {}", now.format("%Y-%m-%d_%H-%M-%S"))
+    });
+    manager.set_meeting_name(Some(effective_meeting_name));
+
+    // DIFF vs normal path: no engine/model — recording without AI.
+    // (`engine` is a String, `model` an Option; empty engine + None signals "no AI".)
+    manager.set_transcription_info(String::new(), None);
+
+    // Set up error callback
+    let app_for_error = app.clone();
+    manager.set_error_callback(move |error| {
+        let _ = app_for_error.emit("recording-error", error.user_message());
+    });
+
+    // Start recording with resolved devices. auto_save is forced true above.
+    let transcription_receiver = manager
+        .start_recording(microphone_device, system_device, auto_save, recording_mode)
+        .await
+        .map_err(|e| format!("Failed to start recording: {}", e))?;
+
+    // DIFF vs normal path: drop the transcription receiver — no transcription
+    // task is started and no transcript-update listener is registered.
+    drop(transcription_receiver);
+
+    // Get recording state before storing manager (for audio level emission)
+    let recording_state_arc = manager.recording_state();
+
+    // Store the manager globally to keep it alive
+    {
+        let mut global_manager = RECORDING_MANAGER.lock().unwrap();
+        *global_manager = Some(manager);
+    }
+
+    // Set recording flag and reset speech detection flag
+    info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    IS_RECORDING.store(true, Ordering::SeqCst);
+    reset_speech_detected_flag(); // Reset for new recording session
+
+    // KEEP (verbatim from normal path): audio-levels emit loop — reads real RMS
+    // from pipeline and emits to frontend (mic/system RMS + FFT bands for panel).
+    {
+        let app_for_levels = app.clone();
+        let level_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
+            while IS_RECORDING.load(Ordering::SeqCst) {
+                interval.tick().await;
+                let mic_rms = recording_state_arc.mic_rms();
+                let sys_rms = recording_state_arc.system_rms();
+
+                // Equalizador FFT de 3 bandas a partir da janela recente de áudio
+                // mixado (mono, 48kHz). A função retorna zeros se a janela for curta.
+                let window = recording_state_arc.recent_mix_window();
+                let bands = crate::cli::fft::three_bands(&window, 48_000);
+
+                let update = serde_json::json!({
+                    "mic_rms": mic_rms,
+                    "system_rms": sys_rms,
+                    "bands": [bands[0], bands[1], bands[2]],
+                });
+
+                if let Err(e) = app_for_levels.emit("audio-levels", &update) {
+                    error!("Failed to emit audio levels: {}", e);
+                    break;
+                }
+            }
+            info!("Audio level emission task ended");
+        });
+        let mut global_level_task = AUDIO_LEVEL_TASK.lock().unwrap();
+        *global_level_task = Some(level_task);
+    }
+
+    // DIFF vs normal path: no transcription task, no transcript-update listener.
+
+    // Emit success event
+    app.emit("recording-started", serde_json::json!({
+        "message": "Recording started in record-only mode (no AI)",
+        "devices": ["Default Microphone", "Default System Audio"],
+        "record_only": true
+    })).map_err(|e| e.to_string())?;
+
+    // Update tray menu to reflect recording state (may log a harmless error headless)
+    crate::tray::update_tray_menu(&app);
+
+    info!("✅ Record-only recording started successfully (no AI)");
+
+    Ok(())
+}
+
 /// Start recording with specific devices
 pub async fn start_recording_with_devices<R: Runtime>(
     app: AppHandle<R>,

@@ -214,12 +214,15 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     }));
 
     // Registra um listener próprio da CLI no evento transcript-update (somente finais).
-    let listener_id = {
+    // Em --record-only NÃO há transcrição, então não registramos este listener.
+    let listener_id: Option<tauri::EventId> = if args.record_only {
+        None
+    } else {
         use tauri::Listener;
         let segments = segments.clone();
         let panel = panel.clone();
         let quiet = args.quiet;
-        app.listen("transcript-update", move |event: tauri::Event| {
+        Some(app.listen("transcript-update", move |event: tauri::Event| {
             if let Ok(u) = serde_json::from_str::<
                 crate::audio::recording_commands::TranscriptUpdate,
             >(event.payload())
@@ -252,7 +255,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                     guard.push(seg);
                 }
             }
-        })
+        }))
     };
 
     // Listener de níveis de áudio (a cada ~50ms) → alimenta o VU/equalizador do painel.
@@ -276,21 +279,36 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     };
 
     // Inicia a gravação reusando o pipeline do app.
-    if let Err(e) = crate::audio::recording_commands::start_recording_with_meeting_name(
-        app.clone(),
-        Some(effective_name.clone()),
-    )
-    .await
-    {
+    // --record-only: grava SEM IA (não valida/carrega modelo). Caso contrário,
+    // caminho normal (com transcrição ao vivo).
+    let start_result = if args.record_only {
+        crate::audio::recording_commands::start_recording_only(
+            app.clone(),
+            Some(effective_name.clone()),
+        )
+        .await
+    } else {
+        crate::audio::recording_commands::start_recording_with_meeting_name(
+            app.clone(),
+            Some(effective_name.clone()),
+        )
+        .await
+    };
+    if let Err(e) = start_result {
         // Remove os listeners antes de retornar.
         {
             use tauri::Listener;
-            app.unlisten(listener_id);
+            if let Some(id) = listener_id {
+                app.unlisten(id);
+            }
             app.unlisten(levels_listener_id);
         }
-        eprintln!(
-            "Modelo não disponível. Baixe pelo app, ou grave sem IA com --record-only."
-        );
+        // A dica de modelo só faz sentido no caminho normal (com IA).
+        if !args.record_only {
+            eprintln!(
+                "Modelo não disponível. Baixe pelo app, ou grave sem IA com --record-only."
+            );
+        }
         return Err(e);
     }
 
@@ -308,6 +326,8 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // rastreia silêncio (mic+sis abaixo de 0.01) para o alerta.
     let draw_handle = {
         let panel = panel.clone();
+        let record_only = args.record_only;
+        let folder_for_bytes = folder_path.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let mut silent_accum_ms: u64 = 0;
@@ -315,11 +335,26 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
                 interval.tick().await;
+                // Em --record-only, o painel mostra "gravado: X MB". Sob auto_save,
+                // o áudio é escrito incrementalmente em .checkpoints/ dentro da
+                // pasta da reunião, então somamos o tamanho dos arquivos da pasta
+                // (best-effort, barato — uma varredura a cada 250ms).
+                let bytes = if record_only {
+                    folder_for_bytes
+                        .as_deref()
+                        .map(|p| dir_size_bytes(std::path::Path::new(p)))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 let line = {
                     let Ok(mut p) = panel.lock() else { continue };
                     let elapsed = started.elapsed().as_secs();
                     p.elapsed_secs = elapsed;
                     p.pulse_on = (elapsed % 2) == 0;
+                    if record_only {
+                        p.bytes_written = bytes;
+                    }
                     // Silêncio: acumula 250ms por tick quando ambos rms < 0.01.
                     if p.mic_rms < 0.01 && p.system_rms < 0.01 {
                         silent_accum_ms = silent_accum_ms.saturating_add(250);
@@ -352,7 +387,9 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         crate::audio::recording_commands::stop_recording(app.clone(), stop_args).await
     {
         use tauri::Listener;
-        app.unlisten(listener_id);
+        if let Some(id) = listener_id {
+            app.unlisten(id);
+        }
         app.unlisten(levels_listener_id);
         return Err(format!("Falha ao parar a gravação: {}", e));
     }
@@ -360,11 +397,15 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // Remove os listeners da CLI.
     {
         use tauri::Listener;
-        app.unlisten(listener_id);
+        if let Some(id) = listener_id {
+            app.unlisten(id);
+        }
         app.unlisten(levels_listener_id);
     }
 
-    // Coleta os segmentos acumulados.
+    // Coleta os segmentos acumulados. Em --record-only sempre é vazio (sem IA);
+    // o save mesmo assim CRIA a reunião (vide TranscriptsRepository::save_transcript)
+    // com transcripts vazios e a folder_path correta, para o app oferecer Re-transcrever.
     let segments_vec: Vec<serde_json::Value> = match segments.lock() {
         Ok(guard) => guard.clone(),
         Err(_) => Vec::new(),
@@ -386,7 +427,37 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .and_then(|v| v.as_str())
         .unwrap_or("?");
     let folder_display = folder_path.unwrap_or_else(|| "(sem pasta)".to_string());
-    println!("✓ Salvo. meeting_id={} pasta={}", meeting_id, folder_display);
+    if args.record_only {
+        println!(
+            "✓ Gravado (sem IA). meeting_id={} pasta={}  Re-transcreva pelo app quando quiser.",
+            meeting_id, folder_display
+        );
+    } else {
+        println!("✓ Salvo. meeting_id={} pasta={}", meeting_id, folder_display);
+    }
 
     Ok(())
+}
+
+/// Soma recursiva (best-effort) do tamanho de todos os arquivos sob `dir`,
+/// incluindo subpastas como `.checkpoints/`. Ignora erros silenciosamente
+/// (a pasta pode ainda não existir nos primeiros ticks).
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let mut total: u64 = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => total = total.saturating_add(dir_size_bytes(&path)),
+            Ok(ft) if ft.is_file() => {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+            _ => {}
+        }
+    }
+    total
 }
