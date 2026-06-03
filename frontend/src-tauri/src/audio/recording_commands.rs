@@ -570,9 +570,16 @@ pub async fn start_recording_only<R: Runtime>(
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
-    // DIFF vs normal path: drop the transcription receiver — no transcription
-    // task is started and no transcript-update listener is registered.
-    drop(transcription_receiver);
+    // DIFF vs normal path: no transcription task is started and no
+    // transcript-update listener is registered. The receiver is DRAINED (not
+    // dropped): dropping it closes the channel and the pipeline's VAD then
+    // spams "Failed to send VAD segment: channel closed" on every speech
+    // segment. Draining keeps the channel open and discards the segments;
+    // the task ends naturally when the pipeline stops and closes the sender.
+    tokio::spawn(async move {
+        let mut receiver = transcription_receiver;
+        while receiver.recv().await.is_some() {}
+    });
 
     // Get recording state before storing manager (for audio level emission)
     let recording_state_arc = manager.recording_state();
@@ -1034,7 +1041,9 @@ pub async fn stop_recording<R: Runtime>(
                     warn!("⚠️ Failed to unload Whisper model '{}'", current_model);
                 }
             } else {
-                warn!("⚠️ No Whisper engine found to unload model");
+                // Expected when no Whisper engine was created this session
+                // (e.g. record-only mode or Parakeet as the active provider).
+                info!("No Whisper engine found to unload model");
             }
         }
     }
@@ -1138,7 +1147,9 @@ pub async fn stop_recording<R: Runtime>(
         .await
         {
             Ok(_) => info!("✅ Analytics tracked successfully for meeting end"),
-            Err(e) => warn!("⚠️ Failed to track analytics: {}", e),
+            // Non-essential: the analytics client is only initialized by the UI
+            // app (and may be disabled by consent), so absence is expected headless.
+            Err(e) => info!("Failed to track analytics: {}", e),
         }
     }
 
