@@ -11,6 +11,10 @@ fn main() {
         std::env::set_var("RUST_LOG", "warn,app_lib::tray=off");
     }
     let _ = env_logger::try_init();
+    // Redireciona os logs em C do whisper.cpp/ggml (whisper_init_state, ggml_*,
+    // register_backend, ...) para o `log` do Rust — com o default acima (warn),
+    // esse ruído some e deixa de quebrar a linha de status do painel.
+    whisper_rs::install_whisper_log_trampoline();
 
     let cli = Cli::parse();
     let app = runner::build_headless_app().expect("failed to build the headless app");

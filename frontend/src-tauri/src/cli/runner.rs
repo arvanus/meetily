@@ -478,9 +478,20 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .as_ref()
         .map(|l| format!("   ✓ Language: {}", l))
         .unwrap_or_default();
+    // Aceleração compilada no binário (cfg de feature). Com o build CUDA e
+    // use_gpu habilitado, o whisper sobe o modelo na GPU.
+    let accel = if cfg!(feature = "cuda") {
+        "CUDA"
+    } else if cfg!(feature = "vulkan") {
+        "Vulkan"
+    } else if cfg!(target_os = "macos") {
+        "Metal"
+    } else {
+        "CPU"
+    };
     println!(
-        "✓ Engine: {}   ✓ Mic: {}   ✓ System: {}{}",
-        engine_label, mic_label, sys_label, lang_label
+        "✓ Engine: {} [{}]   ✓ Mic: {}   ✓ System: {}{}",
+        engine_label, accel, mic_label, sys_label, lang_label
     );
     println!(
         "✓ Meeting: \"{}\"  → {}",
