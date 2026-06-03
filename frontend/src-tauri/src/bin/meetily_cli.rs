@@ -13,11 +13,11 @@ fn main() {
     let _ = env_logger::try_init();
 
     let cli = Cli::parse();
-    let app = runner::build_headless_app().expect("falha ao construir o app headless");
+    let app = runner::build_headless_app().expect("failed to build the headless app");
     let handle = app.handle().clone();
 
     tauri::async_runtime::block_on(async {
-        runner::init_database(&handle).await.expect("falha ao iniciar o banco");
+        runner::init_database(&handle).await.expect("failed to initialize the database");
     });
 
     // Resolve os diretórios de modelos a partir do AppHandle antes de usar os comandos.
@@ -27,15 +27,15 @@ fn main() {
     match cli.command.unwrap_or(Command::ListDevices) {
         Command::ListDevices => {
             tauri::async_runtime::block_on(runner::run_list_devices())
-                .unwrap_or_else(|e| eprintln!("erro: {e}"));
+                .unwrap_or_else(|e| eprintln!("error: {e}"));
         }
         Command::ListModels => {
             tauri::async_runtime::block_on(runner::run_list_models(&handle))
-                .unwrap_or_else(|e| eprintln!("erro: {e}"));
+                .unwrap_or_else(|e| eprintln!("error: {e}"));
         }
         Command::Record(args) => {
             if let Err(e) = tauri::async_runtime::block_on(runner::run_record(&handle, args)) {
-                eprintln!("erro: {e}");
+                eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }

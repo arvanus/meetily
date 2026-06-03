@@ -36,20 +36,20 @@ pub fn render(s: &PanelState) -> String {
     let dot = if s.pulse_on { '●' } else { '○' };
     let tail = if s.record_only {
         format!(
-            "gravado: {:.1} MB / {}",
+            "recorded: {:.1} MB / {}",
             s.bytes_written as f64 / 1_048_576.0,
             hhmmss(s.elapsed_secs)
         )
     } else {
-        format!("trechos:{}", s.segments)
+        format!("segments:{}", s.segments)
     };
     let warn = if s.silent_secs >= 5 {
-        format!("  ⚠ sem áudio há {}s", s.silent_secs)
+        format!("  ⚠ no audio for {}s", s.silent_secs)
     } else {
         String::new()
     };
     format!(
-        "{dot} REC {time}  │ graves {g} médios {m} agudos {a} │ mic {mic}  sis {sys} │ {tail} │ {em}{warn}",
+        "{dot} REC {time}  │ bass {g} mid {m} treble {a} │ mic {mic}  sys {sys} │ {tail} │ {em}{warn}",
         dot = dot,
         time = hhmmss(s.elapsed_secs),
         g = bar(s.bands[0]),
@@ -71,20 +71,20 @@ mod tests {
     fn record_only_shows_bytes_not_segments() {
         let s = PanelState { record_only: true, bytes_written: 2_097_152, elapsed_secs: 65, ..Default::default() };
         let out = render(&s);
-        assert!(out.contains("gravado: 2.0 MB / 00:01:05"));
-        assert!(!out.contains("trechos:"));
+        assert!(out.contains("recorded: 2.0 MB / 00:01:05"));
+        assert!(!out.contains("segments:"));
     }
 
     #[test]
     fn normal_shows_segments() {
         let s = PanelState { segments: 12, ..Default::default() };
-        assert!(render(&s).contains("trechos:12"));
+        assert!(render(&s).contains("segments:12"));
     }
 
     #[test]
     fn silence_warning_after_5s() {
         let s = PanelState { silent_secs: 6, ..Default::default() };
-        assert!(render(&s).contains("⚠ sem áudio há 6s"));
+        assert!(render(&s).contains("⚠ no audio for 6s"));
     }
 
     #[test]

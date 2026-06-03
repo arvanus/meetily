@@ -31,7 +31,7 @@ pub fn build_headless_app() -> tauri::Result<tauri::App> {
 pub async fn init_database(app: &tauri::AppHandle) -> Result<(), String> {
     let db_manager = DatabaseManager::new_from_app_handle(app)
         .await
-        .map_err(|e| format!("Falha ao abrir o banco: {}", e))?;
+        .map_err(|e| format!("Failed to open the database: {}", e))?;
     app.manage(AppState { db_manager });
     Ok(())
 }
@@ -43,7 +43,7 @@ pub async fn run_list_devices() -> Result<(), String> {
 
     let devices = crate::audio::devices::discovery::list_audio_devices()
         .await
-        .map_err(|e| format!("Falha ao listar dispositivos: {}", e))?;
+        .map_err(|e| format!("Failed to list audio devices: {}", e))?;
 
     let mics: Vec<_> = devices
         .iter()
@@ -54,18 +54,18 @@ pub async fn run_list_devices() -> Result<(), String> {
         .filter(|d| d.device_type == DeviceType::Output)
         .collect();
 
-    println!("Microfones:");
+    println!("Microphones:");
     if mics.is_empty() {
-        println!("  (nenhum)");
+        println!("  (none)");
     } else {
         for d in mics {
             println!("  - {}", d.name);
         }
     }
 
-    println!("Sistema (loopback):");
+    println!("System (loopback):");
     if system.is_empty() {
-        println!("  (nenhum)");
+        println!("  (none)");
     } else {
         for d in system {
             println!("  - {}", d.name);
@@ -101,9 +101,9 @@ pub async fn run_list_models(app: &tauri::AppHandle) -> Result<(), String> {
     };
 
     if default_provider.is_empty() {
-        println!("Padrão: (não configurado)");
+        println!("Default: (not configured)");
     } else {
-        println!("Padrão: {}/{}", default_provider, default_model);
+        println!("Default: {}/{}", default_provider, default_model);
     }
 
     // O engine Parakeet não tem fallback standalone; inicializa para descobrir modelos.
@@ -120,13 +120,13 @@ pub async fn run_list_models(app: &tauri::AppHandle) -> Result<(), String> {
                     "  - {} ({} MB){}{}",
                     m.name,
                     m.size_mb,
-                    if downloaded { " [baixado]" } else { "" },
-                    if is_default { " (padrão)" } else { "" },
+                    if downloaded { " [downloaded]" } else { "" },
+                    if is_default { " (default)" } else { "" },
                 );
             }
         }
         Ok(_) => println!("  (nenhum)"),
-        Err(e) => println!("  (erro: {})", e),
+        Err(e) => println!("  (error: {})", e),
     }
 
     // 3. Parakeet
@@ -140,13 +140,13 @@ pub async fn run_list_models(app: &tauri::AppHandle) -> Result<(), String> {
                     "  - {} ({} MB){}{}",
                     m.name,
                     m.size_mb,
-                    if downloaded { " [baixado]" } else { "" },
-                    if is_default { " (padrão)" } else { "" },
+                    if downloaded { " [downloaded]" } else { "" },
+                    if is_default { " (default)" } else { "" },
                 );
             }
         }
         Ok(_) => println!("  (nenhum)"),
-        Err(e) => println!("  (erro: {})", e),
+        Err(e) => println!("  (error: {})", e),
     }
 
     Ok(())
@@ -224,7 +224,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
             Some(other) => {
                 // Provider desconhecido: avisa e segue com o original (não grava lixo).
                 eprintln!(
-                    "Aviso: --engine '{}' desconhecido; usando o provider configurado.",
+                    "Warning: unknown --engine '{}'; using the configured provider.",
                     other
                 );
                 base_provider.clone()
@@ -249,7 +249,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .await
         {
             // Falha ao gravar o override: restaura nada (não gravamos) e segue.
-            eprintln!("Aviso: não foi possível aplicar o override de engine/model: {}", e);
+            eprintln!("Warning: could not apply the engine/model override: {}", e);
         } else {
             let label_provider = if new_provider == "localWhisper" {
                 "whisper"
@@ -257,7 +257,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 new_provider.as_str()
             };
             println!(
-                "ℹ Override temporário: {}/{} (a config original será restaurada ao final).",
+                "ℹ Temporary override: {}/{} (the original config will be restored when done).",
                 label_provider, new_model
             );
         }
@@ -278,7 +278,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 )
                 .await
                 {
-                    eprintln!("Aviso: falha ao restaurar a config de transcrição original: {}", e);
+                    eprintln!("Warning: failed to restore the original transcription config: {}", e);
                 }
             }
         };
@@ -293,7 +293,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // Task 2). Se falhar, mostra "?". Em --record-only não há IA → "sem IA" (7c).
     // Lido APÓS o override acima, para refletir o motor/modelo que será de fato usado.
     let engine_model = if args.record_only {
-        "sem IA".to_string()
+        "no AI".to_string()
     } else {
         match crate::api::api::api_get_transcript_config(
             app.clone(),
@@ -447,10 +447,10 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         // A dica de modelo só faz sentido no caminho normal (com IA).
         if !args.record_only {
             eprintln!(
-                "Modelo não disponível. Baixe pelo app, ou grave sem IA com --record-only."
+                "Transcription model not available. Download it in the app, or record without AI using --record-only."
             );
         }
-        return Err(format!("Falha ao iniciar a gravação: {}", e));
+        return Err(format!("Failed to start recording: {}", e));
     }
 
     // Captura o caminho da pasta da reunião AGORA: stop_recording faz take() do
@@ -462,19 +462,19 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
 
     // (7b) Banner de início. Rótulos informativos (não fazemos resolução pesada de
     // dispositivo): mic/system vêm de --mic/--system se informados, senão "padrão (SO)".
-    let mic_label = args.mic.clone().unwrap_or_else(|| "padrão (SO)".to_string());
-    let sys_label = args.system.clone().unwrap_or_else(|| "padrão (SO)".to_string());
+    let mic_label = args.mic.clone().unwrap_or_else(|| "default (OS)".to_string());
+    let sys_label = args.system.clone().unwrap_or_else(|| "default (OS)".to_string());
     println!(
-        "✓ Motor: {}   ✓ Mic: {}   ✓ Sistema: {}",
+        "✓ Engine: {}   ✓ Mic: {}   ✓ System: {}",
         engine_label, mic_label, sys_label
     );
     println!(
-        "✓ Reunião: \"{}\"  → {}",
+        "✓ Meeting: \"{}\"  → {}",
         effective_name,
-        folder_path.clone().unwrap_or_else(|| "(pasta a criar)".into())
+        folder_path.clone().unwrap_or_else(|| "(folder to be created)".into())
     );
 
-    println!("Gravando. Ctrl+C para parar e salvar.");
+    println!("Recording. Press Ctrl+C to stop and save.");
 
     // Draw task do painel vivo: redesenha ~4x/s na própria linha, sempre (mesmo com
     // --quiet; quiet só esconde o texto dos transcripts). Toggla o ponto a cada ~1s e
@@ -532,7 +532,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     draw_handle.abort();
     println!();
 
-    println!("Parando e salvando...");
+    println!("Stopping and saving...");
 
     // Para a gravação (force-flush + espera workers + grava arquivos finais).
     let stop_args = crate::audio::recording_commands::RecordingArgs {
@@ -543,7 +543,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     {
         unlisten_all!();
         restore_config!();
-        return Err(format!("Falha ao parar a gravação: {}", e));
+        return Err(format!("Failed to stop recording: {}", e));
     }
 
     // Remove os listeners da CLI e restaura a config original (override).
@@ -568,20 +568,20 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         None,
     )
     .await
-    .map_err(|e| format!("Falha ao salvar a reunião no banco: {}", e))?;
+    .map_err(|e| format!("Failed to save the meeting to the database: {}", e))?;
 
     let meeting_id = result
         .get("meeting_id")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    let folder_display = folder_path.unwrap_or_else(|| "(sem pasta)".to_string());
+    let folder_display = folder_path.unwrap_or_else(|| "(no folder)".to_string());
     if args.record_only {
         println!(
-            "✓ Gravado (sem IA). meeting_id={} pasta={}  Re-transcreva pelo app quando quiser.",
+            "✓ Recorded (no AI). meeting_id={} folder={}  Re-transcribe in the app whenever you want.",
             meeting_id, folder_display
         );
     } else {
-        println!("✓ Salvo. meeting_id={} pasta={}", meeting_id, folder_display);
+        println!("✓ Saved. meeting_id={} folder={}", meeting_id, folder_display);
     }
 
     Ok(())
