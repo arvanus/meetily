@@ -183,28 +183,137 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         ),
     };
 
+    // === OVERRIDE de engine/model (--engine / --model) =========================
+    // IMPORTANTE: o worker de transcrição escolhe provider+model SEMPRE a partir da
+    // config PERSISTIDA no banco (api_get_transcript_config), inclusive recarregando
+    // o modelo para casar com a config mesmo que outro já esteja carregado
+    // (vide get_or_init_whisper). Logo, NÃO basta carregar o modelo no engine: a única
+    // forma de o override valer é gravar a config. Para não mexer permanentemente nas
+    // preferências do usuário, capturamos a config ORIGINAL aqui e a RESTAURAMOS em
+    // TODOS os caminhos de saída (sucesso, erro, Ctrl+C) — vide `restore_config!`.
+    // Em --record-only não há IA, então o override é ignorado (sem efeito/sem write).
+    let override_active = !args.record_only && (args.engine.is_some() || args.model.is_some());
+
+    // Config original (provider, model), conforme o banco a resolve. Usada para
+    // restaurar ao final. Capturada SEMPRE que houver override.
+    let original_cfg: Option<(String, String)> = if override_active {
+        match crate::api::api::api_get_transcript_config(
+            app.clone(),
+            app.state::<AppState>(),
+            None,
+        )
+        .await
+        {
+            Ok(Some(c)) => Some((c.provider, c.model)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if override_active {
+        // Mapeia o --engine amigável (whisper/parakeet) para o provider persistido
+        // (localWhisper/parakeet). Se --engine não vier, mantém o provider original.
+        let base_provider = original_cfg
+            .as_ref()
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| "localWhisper".to_string());
+        let new_provider = match args.engine.as_deref() {
+            Some("whisper") | Some("localWhisper") => "localWhisper".to_string(),
+            Some("parakeet") => "parakeet".to_string(),
+            Some(other) => {
+                // Provider desconhecido: avisa e segue com o original (não grava lixo).
+                eprintln!(
+                    "Aviso: --engine '{}' desconhecido; usando o provider configurado.",
+                    other
+                );
+                base_provider.clone()
+            }
+            None => base_provider.clone(),
+        };
+        // Se --model não vier, mantém o modelo original.
+        let new_model = args
+            .model
+            .clone()
+            .or_else(|| original_cfg.as_ref().map(|(_, m)| m.clone()))
+            .unwrap_or_default();
+
+        if let Err(e) = crate::api::api::api_save_transcript_config(
+            app.clone(),
+            app.state::<AppState>(),
+            new_provider.clone(),
+            new_model.clone(),
+            None,
+            None,
+        )
+        .await
+        {
+            // Falha ao gravar o override: restaura nada (não gravamos) e segue.
+            eprintln!("Aviso: não foi possível aplicar o override de engine/model: {}", e);
+        } else {
+            let label_provider = if new_provider == "localWhisper" {
+                "whisper"
+            } else {
+                new_provider.as_str()
+            };
+            println!(
+                "ℹ Override temporário: {}/{} (a config original será restaurada ao final).",
+                label_provider, new_model
+            );
+        }
+    }
+
+    // Helper: restaura a config original (se houver) gravada antes do override.
+    // Roda em todos os caminhos de saída. É idempotente/best-effort.
+    macro_rules! restore_config {
+        () => {
+            if let Some((ref p, ref m)) = original_cfg {
+                if let Err(e) = crate::api::api::api_save_transcript_config(
+                    app.clone(),
+                    app.state::<AppState>(),
+                    p.clone(),
+                    m.clone(),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    eprintln!("Aviso: falha ao restaurar a config de transcrição original: {}", e);
+                }
+            }
+        };
+    }
+    // ==========================================================================
+
     // Acumulador de segmentos finalizados (apenas para impressão + salvar no banco).
     // O listener interno do app continua cuidando do transcripts.json em disco.
     let segments: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Rótulo engine/model para o painel: reusa a config padrão do banco (igual à
-    // Task 2). Se falhar, mostra "?".
-    let engine_model = match crate::api::api::api_get_transcript_config(
-        app.clone(),
-        app.state::<AppState>(),
-        None,
-    )
-    .await
-    {
-        Ok(Some(c)) => {
-            let provider = match c.provider.as_str() {
-                "localWhisper" => "whisper".to_string(),
-                other => other.to_string(),
-            };
-            format!("{}/{}", provider, c.model)
+    // Task 2). Se falhar, mostra "?". Em --record-only não há IA → "sem IA" (7c).
+    // Lido APÓS o override acima, para refletir o motor/modelo que será de fato usado.
+    let engine_model = if args.record_only {
+        "sem IA".to_string()
+    } else {
+        match crate::api::api::api_get_transcript_config(
+            app.clone(),
+            app.state::<AppState>(),
+            None,
+        )
+        .await
+        {
+            Ok(Some(c)) => {
+                let provider = match c.provider.as_str() {
+                    "localWhisper" => "whisper".to_string(),
+                    other => other.to_string(),
+                };
+                format!("{}/{}", provider, c.model)
+            }
+            _ => "?".to_string(),
         }
-        _ => "?".to_string(),
     };
+    // Rótulo do motor para o banner (7b): "sem IA" em record-only, senão engine_model.
+    let engine_label = engine_model.clone();
 
     // Estado compartilhado do painel vivo (alimentado por audio-levels + contadores).
     let panel = Arc::new(Mutex::new(crate::cli::panel::PanelState {
@@ -278,6 +387,43 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         })
     };
 
+    // (7a) Listener de transcrições PARCIAIS (--partial): o app emite
+    // "transcript-partial" com JSON { "text": ... } (worker.rs:229). Sobrescreve a
+    // linha atual com o parcial em cinza. Só ativo no modo normal e sem --quiet;
+    // as linhas finais (transcript-update) imprimem por cima depois — esperado.
+    let partial_listener_id: Option<tauri::EventId> = if args.partial && !args.record_only {
+        use tauri::Listener;
+        let quiet = args.quiet;
+        Some(app.listen("transcript-partial", move |e: tauri::Event| {
+            if quiet {
+                return;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(e.payload()) {
+                if let Some(t) = v["text"].as_str() {
+                    print!("\r\x1b[K\x1b[90m… {}\x1b[0m", t);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Helper: remove TODOS os listeners da CLI (transcript-update, audio-levels,
+    // transcript-partial). Usado em todos os caminhos de saída.
+    macro_rules! unlisten_all {
+        () => {{
+            use tauri::Listener;
+            if let Some(id) = listener_id {
+                app.unlisten(id);
+            }
+            app.unlisten(levels_listener_id);
+            if let Some(id) = partial_listener_id {
+                app.unlisten(id);
+            }
+        }};
+    }
+
     // Inicia a gravação reusando o pipeline do app.
     // --record-only: grava SEM IA (não valida/carrega modelo). Caso contrário,
     // caminho normal (com transcrição ao vivo).
@@ -295,21 +441,16 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .await
     };
     if let Err(e) = start_result {
-        // Remove os listeners antes de retornar.
-        {
-            use tauri::Listener;
-            if let Some(id) = listener_id {
-                app.unlisten(id);
-            }
-            app.unlisten(levels_listener_id);
-        }
+        // Remove os listeners e restaura a config antes de retornar.
+        unlisten_all!();
+        restore_config!();
         // A dica de modelo só faz sentido no caminho normal (com IA).
         if !args.record_only {
             eprintln!(
                 "Modelo não disponível. Baixe pelo app, ou grave sem IA com --record-only."
             );
         }
-        return Err(e);
+        return Err(format!("Falha ao iniciar a gravação: {}", e));
     }
 
     // Captura o caminho da pasta da reunião AGORA: stop_recording faz take() do
@@ -318,6 +459,20 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .await
         .ok()
         .flatten();
+
+    // (7b) Banner de início. Rótulos informativos (não fazemos resolução pesada de
+    // dispositivo): mic/system vêm de --mic/--system se informados, senão "padrão (SO)".
+    let mic_label = args.mic.clone().unwrap_or_else(|| "padrão (SO)".to_string());
+    let sys_label = args.system.clone().unwrap_or_else(|| "padrão (SO)".to_string());
+    println!(
+        "✓ Motor: {}   ✓ Mic: {}   ✓ Sistema: {}",
+        engine_label, mic_label, sys_label
+    );
+    println!(
+        "✓ Reunião: \"{}\"  → {}",
+        effective_name,
+        folder_path.clone().unwrap_or_else(|| "(pasta a criar)".into())
+    );
 
     println!("Gravando. Ctrl+C para parar e salvar.");
 
@@ -386,22 +541,14 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     if let Err(e) =
         crate::audio::recording_commands::stop_recording(app.clone(), stop_args).await
     {
-        use tauri::Listener;
-        if let Some(id) = listener_id {
-            app.unlisten(id);
-        }
-        app.unlisten(levels_listener_id);
+        unlisten_all!();
+        restore_config!();
         return Err(format!("Falha ao parar a gravação: {}", e));
     }
 
-    // Remove os listeners da CLI.
-    {
-        use tauri::Listener;
-        if let Some(id) = listener_id {
-            app.unlisten(id);
-        }
-        app.unlisten(levels_listener_id);
-    }
+    // Remove os listeners da CLI e restaura a config original (override).
+    unlisten_all!();
+    restore_config!();
 
     // Coleta os segmentos acumulados. Em --record-only sempre é vazio (sem IA);
     // o save mesmo assim CRIA a reunião (vide TranscriptsRepository::save_transcript)
@@ -420,7 +567,8 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         folder_path.clone(),
         None,
     )
-    .await?;
+    .await
+    .map_err(|e| format!("Falha ao salvar a reunião no banco: {}", e))?;
 
     let meeting_id = result
         .get("meeting_id")
