@@ -183,6 +183,15 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         ),
     };
 
+    // Idioma da transcrição (--language): repassado direto para a preferência global
+    // que o worker/whisper lê a cada chunk. Sem validação — o engine decide o que
+    // fazer com o código (ex.: "pt", "en", "auto"; default do app: "auto-translate").
+    if let Some(lang) = &args.language {
+        if let Err(e) = crate::set_language_preference_internal(lang.clone()) {
+            eprintln!("Warning: could not set language preference: {}", e);
+        }
+    }
+
     // === OVERRIDE de engine/model (--engine / --model) =========================
     // IMPORTANTE: o worker de transcrição escolhe provider+model SEMPRE a partir da
     // config PERSISTIDA no banco (api_get_transcript_config), inclusive recarregando
@@ -464,9 +473,14 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // dispositivo): mic/system vêm de --mic/--system se informados, senão "padrão (SO)".
     let mic_label = args.mic.clone().unwrap_or_else(|| "default (OS)".to_string());
     let sys_label = args.system.clone().unwrap_or_else(|| "default (OS)".to_string());
+    let lang_label = args
+        .language
+        .as_ref()
+        .map(|l| format!("   ✓ Language: {}", l))
+        .unwrap_or_default();
     println!(
-        "✓ Engine: {}   ✓ Mic: {}   ✓ System: {}",
-        engine_label, mic_label, sys_label
+        "✓ Engine: {}   ✓ Mic: {}   ✓ System: {}{}",
+        engine_label, mic_label, sys_label, lang_label
     );
     println!(
         "✓ Meeting: \"{}\"  → {}",
@@ -532,15 +546,49 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     draw_handle.abort();
     println!();
 
-    println!("Stopping and saving...");
+    println!("Stopping and saving... (finishing queued transcription; press Ctrl+C again to abandon)");
+
+    // Mostra o progresso do shutdown (o app emite "recording-shutdown-progress"
+    // enquanto processa a fila de transcrição) para não parecer congelado quando
+    // a fila está grande (ex.: modelo lento que não acompanhou o tempo real).
+    let progress_listener = {
+        use tauri::Listener;
+        app.listen("recording-shutdown-progress", move |e: tauri::Event| {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(e.payload()) {
+                if let Some(msg) = v["message"].as_str() {
+                    print!("\r\x1b[K⏳ {}", msg);
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        })
+    };
 
     // Para a gravação (force-flush + espera workers + grava arquivos finais).
+    // Um SEGUNDO Ctrl+C aqui significa "desisti de esperar a fila": restauramos a
+    // config (override) ANTES de sair — matar o processo sem isso deixava a
+    // config do app presa no modelo do override.
     let stop_args = crate::audio::recording_commands::RecordingArgs {
         save_path: folder_path.clone().unwrap_or_default(),
     };
-    if let Err(e) =
-        crate::audio::recording_commands::stop_recording(app.clone(), stop_args).await
+    let stop_result = tokio::select! {
+        r = crate::audio::recording_commands::stop_recording(app.clone(), stop_args) => r,
+        _ = tokio::signal::ctrl_c() => {
+            println!();
+            eprintln!(
+                "⚠ Aborted while processing the transcription backlog; pending segments were lost \
+                 (audio checkpoints remain on disk)."
+            );
+            restore_config!();
+            std::process::exit(130);
+        }
+    };
     {
+        use tauri::Listener;
+        app.unlisten(progress_listener);
+    }
+    print!("\r\x1b[K");
+    let _ = std::io::stdout().flush();
+    if let Err(e) = stop_result {
         unlisten_all!();
         restore_config!();
         return Err(format!("Failed to stop recording: {}", e));

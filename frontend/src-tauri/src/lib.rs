@@ -417,6 +417,13 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
 #[tauri::command]
 async fn set_language_preference(language: String) -> Result<(), String> {
+    set_language_preference_internal(language)
+}
+
+// Internal helper to set the language preference from Rust code (e.g. the CLI).
+// NOTE: kept separate because marking the #[tauri::command] itself `pub` at the
+// crate root collides with the generated __cmd__/__tauri_command_name_ macros.
+pub fn set_language_preference_internal(language: String) -> Result<(), String> {
     let mut lang_pref = LANGUAGE_PREFERENCE
         .lock()
         .map_err(|e| format!("Failed to set language preference: {}", e))?;

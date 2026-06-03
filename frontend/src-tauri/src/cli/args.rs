@@ -28,6 +28,10 @@ pub struct RecordArgs {
     /// Transcription engine (whisper|parakeet); default: the one configured in the app
     #[arg(long)]
     pub engine: Option<String>,
+    /// Transcription language code passed through to the engine (e.g. "pt", "en", "auto");
+    /// used by Whisper. Default: the app preference ("auto-translate" = translate to English)
+    #[arg(long)]
+    pub language: Option<String>,
     /// Model name; default: the one configured in the app
     #[arg(long)]
     pub model: Option<String>,
@@ -73,6 +77,13 @@ mod tests {
         let cli = Cli::parse_from(["meetily-cli", "record", "--record-only", "--no-audio-save"]);
         let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn language_is_passed_through() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--language", "pt"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert_eq!(args.language.as_deref(), Some("pt"));
     }
 
     #[test]
