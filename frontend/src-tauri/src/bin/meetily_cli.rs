@@ -3,7 +3,13 @@ use app_lib::cli::runner;
 use clap::Parser;
 
 fn main() {
-    std::env::set_var("RUST_LOG", "info");
+    // Logs do framework são ruído no CLI: a transcrição ao vivo e o painel usam stdout
+    // direto (println!), então deixamos o log padrão enxuto (só warn/erro) e silenciamos
+    // o erro inofensivo de bandeja (`app_lib::tray`), que não existe no modo headless.
+    // O usuário pode sobrescrever exportando RUST_LOG (ex.: RUST_LOG=info para depurar).
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "warn,app_lib::tray=off");
+    }
     let _ = env_logger::try_init();
 
     let cli = Cli::parse();
