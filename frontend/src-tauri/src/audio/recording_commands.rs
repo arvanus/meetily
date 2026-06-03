@@ -321,9 +321,15 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                 let mic_rms = recording_state_arc.mic_rms();
                 let sys_rms = recording_state_arc.system_rms();
 
+                // Equalizador FFT de 3 bandas a partir da janela recente de áudio
+                // mixado (mono, 48kHz). A função retorna zeros se a janela for curta.
+                let window = recording_state_arc.recent_mix_window();
+                let bands = crate::cli::fft::three_bands(&window, 48_000);
+
                 let update = serde_json::json!({
                     "mic_rms": mic_rms,
                     "system_rms": sys_rms,
+                    "bands": [bands[0], bands[1], bands[2]],
                 });
 
                 if let Err(e) = app_for_levels.emit("audio-levels", &update) {

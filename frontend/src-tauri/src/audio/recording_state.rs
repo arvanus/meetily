@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -131,7 +132,16 @@ pub struct RecordingState {
     // Real-time audio levels for UI visualization (stored as f32 bits in AtomicU32)
     mic_rms_level: AtomicU32,
     system_rms_level: AtomicU32,
+
+    // Recent mixed (mono, 48kHz) samples for FFT-based equalizer in the CLI panel.
+    // Small ring buffer pushed from the pipeline's mixing window; read by the
+    // 50ms emit loop. Lightweight and behind a Mutex (negligible overhead).
+    recent_mix: Mutex<VecDeque<f32>>,
 }
+
+/// Capacity (in samples) of the recent-mix ring buffer. ~43ms at 48kHz; a
+/// power of two so the FFT planner stays cheap.
+const RECENT_MIX_CAPACITY: usize = 2048;
 
 impl RecordingState {
     pub fn new() -> Arc<Self> {
@@ -154,6 +164,7 @@ impl RecordingState {
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
             mic_rms_level: AtomicU32::new(0),
             system_rms_level: AtomicU32::new(0),
+            recent_mix: Mutex::new(VecDeque::with_capacity(RECENT_MIX_CAPACITY)),
         })
     }
 
@@ -238,6 +249,29 @@ impl RecordingState {
     /// Read current system audio RMS level (0.0 to 1.0)
     pub fn system_rms(&self) -> f32 {
         f32::from_bits(self.system_rms_level.load(Ordering::Relaxed))
+    }
+
+    /// Push a window of freshly mixed (mono, 48kHz) samples into the recent-mix
+    /// ring buffer. Called from the pipeline mixing loop; keeps only the most
+    /// recent `RECENT_MIX_CAPACITY` samples for the CLI equalizer FFT.
+    pub fn push_mix_window(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let mut buf = self.recent_mix.lock().unwrap();
+        for &s in samples {
+            if buf.len() >= RECENT_MIX_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(s);
+        }
+    }
+
+    /// Copy of the most recent mixed (mono, 48kHz) samples for FFT analysis.
+    /// Returns an empty Vec until enough audio has been mixed.
+    pub fn recent_mix_window(&self) -> Vec<f32> {
+        let buf = self.recent_mix.lock().unwrap();
+        buf.iter().copied().collect()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -464,6 +498,7 @@ impl Default for RecordingState {
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
             mic_rms_level: AtomicU32::new(0),
             system_rms_level: AtomicU32::new(0),
+            recent_mix: Mutex::new(VecDeque::with_capacity(RECENT_MIX_CAPACITY)),
         }
     }
 }

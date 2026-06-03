@@ -866,6 +866,10 @@ impl AudioPipeline {
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
+                            // Feed the recent-mix ring buffer (mono, 48kHz) for the
+                            // CLI equalizer FFT. Cheap copy into a small bounded buffer.
+                            self.state.push_mix_window(&mixed_clean);
+
                             // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
                             // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
                             // System audio at natural levels
