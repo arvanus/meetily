@@ -14,9 +14,19 @@ fn main() {
         runner::init_database(&handle).await.expect("falha ao iniciar o banco");
     });
 
+    // Resolve os diretórios de modelos a partir do AppHandle antes de usar os comandos.
+    app_lib::whisper_engine::commands::set_models_directory(&handle);
+    app_lib::parakeet_engine::commands::set_models_directory(&handle);
+
     match cli.command.unwrap_or(Command::ListDevices) {
-        Command::ListDevices => println!("(list-devices: implementado na Task 2)"),
-        Command::ListModels => println!("(list-models: implementado na Task 2)"),
+        Command::ListDevices => {
+            tauri::async_runtime::block_on(runner::run_list_devices())
+                .unwrap_or_else(|e| eprintln!("erro: {e}"));
+        }
+        Command::ListModels => {
+            tauri::async_runtime::block_on(runner::run_list_models(&handle))
+                .unwrap_or_else(|e| eprintln!("erro: {e}"));
+        }
         Command::Record(_args) => println!("(record: implementado na Task 3)"),
     }
 }
