@@ -1,4 +1,4 @@
-use app_lib::cli::args::{Cli, Command};
+use app_lib::cli::args::{Cli, Command, RecordArgs};
 use app_lib::cli::runner;
 use clap::Parser;
 
@@ -28,7 +28,8 @@ fn main() {
     app_lib::whisper_engine::commands::set_models_directory(&handle);
     app_lib::parakeet_engine::commands::set_models_directory(&handle);
 
-    match cli.command.unwrap_or(Command::ListDevices) {
+    // Sem subcomando = gravar com a config padrão do app (Record é o default).
+    match cli.command.unwrap_or(Command::Record(RecordArgs::default())) {
         Command::ListDevices => {
             tauri::async_runtime::block_on(runner::run_list_devices())
                 .unwrap_or_else(|e| eprintln!("error: {e}"));
