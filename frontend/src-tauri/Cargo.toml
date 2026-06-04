@@ -1,6 +1,6 @@
 [package]
 name = "meetily"
-version = "0.3.0"
+version = "0.4.0"
 # Com dois [[bin]] (meetily + meetily-cli), `cargo run` (usado pelo `tauri dev`)
 # precisa saber qual e o padrao — sem isso o dev-gpu.bat falha.
 default-run = "meetily"
