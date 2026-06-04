@@ -27,6 +27,17 @@ fn meter(level: f32, width: usize) -> String {
     (0..width).map(|i| if i < filled { '▮' } else { '▯' }).collect()
 }
 
+/// Converte RMS linear em nível perceptual 0..1 (escala dB). Fala normal fica em
+/// RMS ~0.02-0.15, que num medidor linear mal sai do primeiro bloco; mapeamos
+/// -50 dBFS (silêncio útil) até 0 dBFS (full scale) para encher o medidor.
+fn rms_to_level(rms: f32) -> f32 {
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db + 50.0) / 50.0).clamp(0.0, 1.0)
+}
+
 fn hhmmss(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
@@ -49,14 +60,14 @@ pub fn render(s: &PanelState) -> String {
         String::new()
     };
     format!(
-        "{dot} REC {time}  │ bass {g} mid {m} treble {a} │ mic {mic}  sys {sys} │ {tail} │ {em}{warn}",
+        "{dot} REC {time} │ eq {g}{m}{a} │ mic {mic} sys {sys} │ {tail} │ {em}{warn}",
         dot = dot,
         time = hhmmss(s.elapsed_secs),
         g = bar(s.bands[0]),
         m = bar(s.bands[1]),
         a = bar(s.bands[2]),
-        mic = meter(s.mic_rms, 4),
-        sys = meter(s.system_rms, 4),
+        mic = meter(rms_to_level(s.mic_rms), 4),
+        sys = meter(rms_to_level(s.system_rms), 4),
         tail = tail,
         em = s.engine_model,
         warn = warn,
@@ -85,6 +96,17 @@ mod tests {
     fn silence_warning_after_5s() {
         let s = PanelState { silent_secs: 6, ..Default::default() };
         assert!(render(&s).contains("⚠ no audio for 6s"));
+    }
+
+    #[test]
+    fn meter_is_perceptual_not_linear() {
+        // Fala normal (RMS ~0.05 ≈ -26 dBFS) precisa encher ~metade do medidor,
+        // não ficar presa no primeiro bloco como na escala linear.
+        assert_eq!(rms_to_level(0.0), 0.0);
+        assert!(rms_to_level(0.003) < 0.05); // ruído de fundo ≈ vazio
+        let speech = rms_to_level(0.05);
+        assert!(speech > 0.4 && speech < 0.6, "speech level = {speech}");
+        assert_eq!(rms_to_level(1.0), 1.0); // full scale enche tudo
     }
 
     #[test]
