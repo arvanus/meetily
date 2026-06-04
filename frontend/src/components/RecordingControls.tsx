@@ -471,11 +471,12 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                     </>
                   )}
 
+                  {/* 3-band FFT equalizer (bass / mid / treble) fed by the audio-levels event */}
                   <div className="flex items-center space-x-[3px] mx-4 h-8">
                     {barHeights.map((height, index) => (
                       <div
                         key={index}
-                        className={`w-[3px] rounded-full transition-all duration-150 ease-in-out ${isPaused ? 'bg-orange-500' : 'bg-red-500'
+                        className={`w-[5px] rounded-full transition-all duration-150 ease-in-out ${isPaused ? 'bg-orange-500' : 'bg-red-500'
                           }`}
                         style={{
                           height: isRecording && !isPaused ? height : '15%',

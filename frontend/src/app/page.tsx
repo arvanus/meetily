@@ -26,7 +26,7 @@ import { Loader2 } from 'lucide-react';
 export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
-  const [barHeights, setBarHeights] = useState(['10%', '10%', '10%', '10%', '10%']);
+  const [barHeights, setBarHeights] = useState(['10%', '10%', '10%']);
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
 
   // Use contexts for state management
@@ -194,28 +194,29 @@ export default function Home() {
 
   useEffect(() => {
     if (!recordingState.isRecording) {
-      setBarHeights(['10%', '10%', '10%', '10%', '10%']);
+      setBarHeights(['10%', '10%', '10%']);
       return;
     }
 
     let unlisten: (() => void) | undefined;
     let mounted = true;
-    let smoothedLevel = 0;
+    const smoothedBands = [0, 0, 0];
 
     import('@tauri-apps/api/event').then(({ listen }) => {
-      listen<{ mic_rms: number; system_rms: number }>('audio-levels', (event) => {
+      // `bands` is a real 3-band FFT (bass <250Hz, mid 250-2000Hz, treble >2kHz)
+      // computed over the mixed audio window on the Rust side, normalized 0..1.
+      listen<{ mic_rms: number; system_rms: number; bands: [number, number, number] }>('audio-levels', (event) => {
         if (!mounted) return;
-        const { mic_rms, system_rms } = event.payload;
-        const rawLevel = Math.min(1.0, mic_rms * 3 + system_rms * 1.5);
-        // EMA smoothing: rise fast (0.4), fall slow (0.15) for natural feel
-        const alpha = rawLevel > smoothedLevel ? 0.4 : 0.15;
-        smoothedLevel = smoothedLevel + alpha * (rawLevel - smoothedLevel);
+        const bands = event.payload.bands ?? [0, 0, 0];
 
-        const barMultipliers = [0.6, 0.85, 1.0, 0.75, 0.5];
         const minHeight = 12;
         const maxHeight = 95;
-        const newHeights = barMultipliers.map(mult => {
-          const height = minHeight + (maxHeight - minHeight) * smoothedLevel * mult;
+        const newHeights = smoothedBands.map((prev, i) => {
+          const raw = Math.min(1.0, bands[i] ?? 0);
+          // EMA smoothing: rise fast (0.4), fall slow (0.15) for natural feel
+          const alpha = raw > prev ? 0.4 : 0.15;
+          smoothedBands[i] = prev + alpha * (raw - prev);
+          const height = minHeight + (maxHeight - minHeight) * smoothedBands[i];
           return Math.min(maxHeight, Math.max(minHeight, height)) + '%';
         });
         setBarHeights(newHeights);
