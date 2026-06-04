@@ -1,6 +1,9 @@
 [package]
 name = "meetily"
 version = "0.3.0"
+# Com dois [[bin]] (meetily + meetily-cli), `cargo run` (usado pelo `tauri dev`)
+# precisa saber qual e o padrao — sem isso o dev-gpu.bat falha.
+default-run = "meetily"
 description = "A Tauri App for meeting minutes"
 authors = ["Sujith S"]
 license = "MIT"
