@@ -4,6 +4,17 @@ use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::time::Duration;
 
+// Long-speech safeguards (all sample counts at the VAD rate of 16kHz):
+// after ADAPTIVE_REDEMPTION_TRIGGER_SAMPLES of accumulated speech the redemption time is
+// lowered so the segment closes at the next micro-pause; if not even that happens by
+// FORCE_SPLIT_SAMPLES, the segment is force-split to keep memory and transcription
+// chunk size bounded (a 150s+ chunk overwhelms Whisper/Parakeet).
+const ADAPTIVE_REDEMPTION_TRIGGER_SAMPLES: usize = 30 * 16000; // 30s
+const AGGRESSIVE_REDEMPTION_TIME: Duration = Duration::from_millis(400); // must stay >= post_speech_pad
+const FORCE_SPLIT_SAMPLES: usize = 60 * 16000; // 60s
+const BUFFER_WARN_THRESHOLD_SAMPLES: usize = 500_000; // ~31s
+const BUFFER_WARN_INTERVAL_SAMPLES: usize = 80_000; // throttle: one warning per ~5s of growth
+
 /// Represents a complete speech segment detected by VAD
 #[derive(Debug, Clone)]
 pub struct SpeechSegment {
@@ -29,6 +40,11 @@ pub struct ContinuousVadProcessor {
     // Partial transcription support: emit intermediate segments during ongoing speech
     partial_interval_samples: usize,  // Emit partial every ~1.5s of speech (24000 samples at 16kHz)
     samples_since_last_partial: usize,
+    // Long-speech safeguards: adaptive redemption + force-split (see process_chunk)
+    base_redemption_time: Duration,
+    aggressive_redemption_active: bool,
+    force_split_occurred: bool,
+    last_buffer_warn_bucket: usize,
 }
 
 impl ContinuousVadProcessor {
@@ -84,7 +100,35 @@ impl ContinuousVadProcessor {
             // Partial transcription: emit intermediate segment every ~1.5s of speech
             partial_interval_samples: 24000, // 1.5s at 16kHz
             samples_since_last_partial: 0,
+            base_redemption_time: Duration::from_millis(redemption_time_ms as u64),
+            aggressive_redemption_active: false,
+            force_split_occurred: false,
+            last_buffer_warn_bucket: 0,
         })
+    }
+
+    /// Whether a "large speech buffer" warning should be emitted for the given buffer size.
+    /// Throttled so the log isn't flooded once per 30ms chunk during long continuous speech.
+    fn should_emit_buffer_warning(&mut self, current_len: usize) -> bool {
+        if current_len <= BUFFER_WARN_THRESHOLD_SAMPLES {
+            return false;
+        }
+        let bucket = current_len / BUFFER_WARN_INTERVAL_SAMPLES;
+        if bucket != self.last_buffer_warn_bucket {
+            self.last_buffer_warn_bucket = bucket;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Restore the configured redemption time after an aggressive (long-speech) episode.
+    fn restore_base_redemption(&mut self) {
+        if self.aggressive_redemption_active {
+            self.session.config_mut().redemption_time = self.base_redemption_time;
+            self.aggressive_redemption_active = false;
+            debug!("VAD: redemption_time restored to {}ms", self.base_redemption_time.as_millis());
+        }
     }
 
     /// Process incoming audio samples and return any complete speech segments
@@ -206,6 +250,11 @@ impl ContinuousVadProcessor {
             self.in_speech = false;
         }
 
+        // Long-speech safeguards: leave the processor in its configured base state
+        self.restore_base_redemption();
+        self.force_split_occurred = false;
+        self.last_buffer_warn_bucket = 0;
+
         // Extract all remaining segments
         while let Some(segment) = self.speech_segments.pop_front() {
             completed_segments.push(segment);
@@ -215,11 +264,10 @@ impl ContinuousVadProcessor {
     }
 
     fn process_chunk(&mut self, chunk: &[f32]) -> Result<()> {
-        // Track accumulated speech buffer size to detect memory issues
+        // Track accumulated speech buffer size (throttled to one warning per ~5s of growth)
         let current_speech_size = self.current_speech.len();
-        if current_speech_size > 1_000_000 {
-            // More than ~62 seconds of accumulated speech at 16kHz
-            warn!("VAD: Accumulated speech buffer is large: {} samples ({:.1}s) - possible memory issue",
+        if self.should_emit_buffer_warning(current_speech_size) {
+            warn!("VAD: Accumulated speech buffer is large: {} samples ({:.1}s) - will split at next micro-pause",
                   current_speech_size, current_speech_size as f64 / 16000.0);
         }
 
@@ -233,57 +281,54 @@ impl ContinuousVadProcessor {
 
         // Handle VAD transitions
         for transition in transitions {
-            match transition {
-                VadTransition::SpeechStart { timestamp_ms } => {
-                    // Only log if state changed
-                    if !self.last_logged_state {
-                        debug!("VAD: Speech started at {}ms", timestamp_ms);
-                        self.last_logged_state = true;
-                    }
-                    self.in_speech = true;
-                    // Use 16000 (VAD processing rate) since processed_samples counts 16kHz samples
-                    self.speech_start_sample = self.processed_samples + (timestamp_ms * 16000 / 1000);
-                    self.current_speech.clear();
-                }
-                VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
-                    // Only log if we were previously in speech state
-                    if self.last_logged_state {
-                        debug!("VAD: Speech ended at {}ms (duration: {}ms)", end_timestamp_ms, end_timestamp_ms - start_timestamp_ms);
-                        self.last_logged_state = false;
-                    }
-                    self.in_speech = false;
-                    self.samples_since_last_partial = 0;
-
-                    // Use samples from VAD transition if available, otherwise use accumulated samples
-                    let speech_samples = if !samples.is_empty() {
-                        samples
-                    } else {
-                        self.current_speech.clone()
-                    };
-
-                    if !speech_samples.is_empty() {
-                        let segment = SpeechSegment {
-                            samples: speech_samples,
-                            start_timestamp_ms: start_timestamp_ms as f64,
-                            end_timestamp_ms: end_timestamp_ms as f64,
-                            confidence: 0.9, // VAD confidence
-                        };
-
-                        info!("VAD: Completed speech segment: {:.1}ms duration, {} samples",
-                              end_timestamp_ms - start_timestamp_ms, segment.samples.len());
-
-                        self.speech_segments.push_back(segment);
-                    }
-
-                    self.current_speech.clear();
-                }
-            }
+            self.handle_transition(transition);
         }
 
         // Accumulate speech if we're currently in a speech state
         if self.in_speech {
             self.current_speech.extend_from_slice(chunk);
             self.samples_since_last_partial += chunk.len();
+
+            // Long speech: lower the redemption time so the segment closes at the next
+            // micro-pause instead of waiting for a full base-redemption silence
+            if !self.aggressive_redemption_active
+                && self.base_redemption_time > AGGRESSIVE_REDEMPTION_TIME
+                && self.current_speech.len() >= ADAPTIVE_REDEMPTION_TRIGGER_SAMPLES
+            {
+                self.session.config_mut().redemption_time = AGGRESSIVE_REDEMPTION_TIME;
+                self.aggressive_redemption_active = true;
+                info!("VAD: speech exceeded {}s - lowering redemption to {}ms to close at next micro-pause",
+                      ADAPTIVE_REDEMPTION_TRIGGER_SAMPLES / 16000, AGGRESSIVE_REDEMPTION_TIME.as_millis());
+            }
+
+            // Backstop: not even a micro-pause was found - force-split so the buffer and
+            // the transcription chunk size stay bounded
+            if self.current_speech.len() >= FORCE_SPLIT_SAMPLES {
+                let end_sample = self.processed_samples + chunk.len();
+                let start_ms = (self.speech_start_sample as f64 / 16000.0) * 1000.0;
+                let end_ms = (end_sample as f64 / 16000.0) * 1000.0;
+
+                warn!("VAD: force-splitting continuous speech at {:.1}s (no pause found)",
+                      self.current_speech.len() as f64 / 16000.0);
+
+                let segment = SpeechSegment {
+                    samples: std::mem::take(&mut self.current_speech),
+                    start_timestamp_ms: start_ms,
+                    end_timestamp_ms: end_ms,
+                    confidence: 0.8, // Estimated confidence for forced split
+                };
+                self.speech_segments.push_back(segment);
+
+                // Speech continues: restart accumulation from here. silero still tracks
+                // the ongoing utterance internally; force_split_occurred tells
+                // handle_transition to emit only the post-split tail on the eventual
+                // SpeechEnd (its `samples` covers the WHOLE utterance - using it would
+                // duplicate the part already emitted above).
+                self.speech_start_sample = end_sample;
+                self.samples_since_last_partial = 0;
+                self.force_split_occurred = true;
+                self.last_buffer_warn_bucket = 0;
+            }
 
             // Emit partial (intermediate) segment every ~1.5s of ongoing speech
             if self.samples_since_last_partial >= self.partial_interval_samples
@@ -309,6 +354,66 @@ impl ContinuousVadProcessor {
 
         self.processed_samples += chunk.len();
         Ok(())
+    }
+
+    /// Handle a single VAD state transition (extracted from process_chunk for testability)
+    fn handle_transition(&mut self, transition: VadTransition) {
+        match transition {
+            VadTransition::SpeechStart { timestamp_ms } => {
+                // Only log if state changed
+                if !self.last_logged_state {
+                    debug!("VAD: Speech started at {}ms", timestamp_ms);
+                    self.last_logged_state = true;
+                }
+                self.in_speech = true;
+                // Use 16000 (VAD processing rate) since processed_samples counts 16kHz samples
+                self.speech_start_sample = self.processed_samples + (timestamp_ms * 16000 / 1000);
+                self.current_speech.clear();
+                self.restore_base_redemption();
+                self.force_split_occurred = false;
+                self.last_buffer_warn_bucket = 0;
+            }
+            VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
+                // Only log if we were previously in speech state
+                if self.last_logged_state {
+                    debug!("VAD: Speech ended at {}ms (duration: {}ms)", end_timestamp_ms, end_timestamp_ms - start_timestamp_ms);
+                    self.last_logged_state = false;
+                }
+                self.in_speech = false;
+                self.samples_since_last_partial = 0;
+                self.restore_base_redemption();
+                self.last_buffer_warn_bucket = 0;
+
+                // Use samples from VAD transition if available, otherwise use accumulated samples.
+                // After a force-split, silero's `samples` covers the WHOLE utterance (including
+                // the part already emitted) - use only the post-split accumulation instead.
+                let force_split = std::mem::replace(&mut self.force_split_occurred, false);
+                let (speech_samples, seg_start_ms) = if force_split {
+                    (self.current_speech.clone(),
+                     (self.speech_start_sample as f64 / 16000.0) * 1000.0)
+                } else if !samples.is_empty() {
+                    (samples, start_timestamp_ms as f64)
+                } else {
+                    (self.current_speech.clone(), start_timestamp_ms as f64)
+                };
+
+                if !speech_samples.is_empty() {
+                    let segment = SpeechSegment {
+                        samples: speech_samples,
+                        start_timestamp_ms: seg_start_ms,
+                        end_timestamp_ms: end_timestamp_ms as f64,
+                        confidence: 0.9, // VAD confidence
+                    };
+
+                    info!("VAD: Completed speech segment: {:.1}ms duration, {} samples",
+                          end_timestamp_ms - start_timestamp_ms, segment.samples.len());
+
+                    self.speech_segments.push_back(segment);
+                }
+
+                self.current_speech.clear();
+            }
+        }
     }
 }
 
@@ -569,6 +674,128 @@ mod tests {
 
         // Should find speech segments
         assert!(all_segments.len() >= 1, "Expected at least 1 speech segment");
+    }
+
+    // === Long-speech safeguards (adaptive redemption + force-split) ===
+    // These tests drive the processor deterministically: in_speech is set manually and
+    // 30ms chunks go straight through process_chunk, bypassing silero's classification
+    // (which is unreliable on synthetic audio — see test_vad_large_file_progress).
+
+    /// Feed `num_chunks` 30ms chunks while in speech state; returns only FINAL segments.
+    fn feed_speech_chunks(p: &mut ContinuousVadProcessor, num_chunks: usize) -> Vec<SpeechSegment> {
+        let chunk = vec![0.0f32; 480];
+        let mut finals = Vec::new();
+        for _ in 0..num_chunks {
+            p.process_chunk(&chunk).expect("process_chunk failed");
+            while let Some(s) = p.speech_segments.pop_front() {
+                if s.confidence >= 0.0 {
+                    finals.push(s);
+                }
+            }
+        }
+        finals
+    }
+
+    #[test]
+    fn test_long_speech_lowers_redemption_after_30s() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        p.in_speech = true;
+        p.speech_start_sample = 0;
+
+        // ~29s of accumulated speech: still on base redemption
+        feed_speech_chunks(&mut p, 29 * 16000 / 480);
+        assert!(!p.aggressive_redemption_active, "below 30s must keep base redemption");
+        assert_eq!(p.session.config_mut().redemption_time, Duration::from_millis(2000));
+
+        // +2s crosses the 30s threshold
+        feed_speech_chunks(&mut p, 2 * 16000 / 480);
+        assert!(p.aggressive_redemption_active, "after 30s of speech redemption must turn aggressive");
+        assert_eq!(p.session.config_mut().redemption_time, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn test_long_speech_force_split_caps_segment_at_60s() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        p.in_speech = true;
+        p.speech_start_sample = 0;
+
+        let finals = feed_speech_chunks(&mut p, 65 * 16000 / 480); // ~65s, no pause
+        assert_eq!(finals.len(), 1, "expected exactly one force-split segment, got {}", finals.len());
+        assert_eq!(finals[0].samples.len(), 60 * 16000, "force-split segment must be capped at 60s");
+        let dur = finals[0].end_timestamp_ms - finals[0].start_timestamp_ms;
+        assert!((dur - 60_000.0).abs() < 100.0, "segment duration should be ~60s, got {}ms", dur);
+        assert!(p.in_speech, "speech must continue after a force-split");
+        assert!(p.current_speech.len() < 6 * 16000, "tail after split should restart accumulation");
+    }
+
+    #[test]
+    fn test_speech_end_after_force_split_does_not_duplicate_audio() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        p.in_speech = true;
+        p.speech_start_sample = 0;
+
+        // ~62s of speech: force-split emits the first 60s
+        let finals = feed_speech_chunks(&mut p, 62 * 16000 / 480);
+        assert_eq!(finals.len(), 1, "precondition: force-split happened");
+        let tail_len = p.current_speech.len();
+        assert!(tail_len > 0, "precondition: tail accumulated after split");
+
+        // silero's eventual SpeechEnd carries the FULL speech since SpeechStart
+        let full_run = vec![0.0f32; 62 * 16000];
+        p.handle_transition(VadTransition::SpeechEnd {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 62_000,
+            samples: full_run,
+        });
+
+        let seg = p.speech_segments.pop_back().expect("SpeechEnd must emit the tail segment");
+        assert_eq!(seg.samples.len(), tail_len,
+            "post-split SpeechEnd must emit only the tail, not the full speech (would duplicate the first 60s)");
+    }
+
+    #[test]
+    fn test_speech_end_restores_base_redemption() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        p.in_speech = true;
+        p.speech_start_sample = 0;
+
+        // Cross the 30s threshold so redemption turns aggressive
+        feed_speech_chunks(&mut p, 31 * 16000 / 480);
+        assert!(p.aggressive_redemption_active, "precondition: aggressive redemption engaged");
+
+        // Natural end of speech must restore the configured redemption time
+        p.handle_transition(VadTransition::SpeechEnd {
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 31_000,
+            samples: vec![0.0f32; 16000],
+        });
+        assert!(!p.aggressive_redemption_active);
+        assert_eq!(p.session.config_mut().redemption_time, Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn test_flush_restores_base_redemption() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        p.in_speech = true;
+        p.speech_start_sample = 0;
+
+        feed_speech_chunks(&mut p, 31 * 16000 / 480);
+        assert!(p.aggressive_redemption_active, "precondition: aggressive redemption engaged");
+
+        let finals = p.flush().unwrap();
+        assert!(!finals.is_empty(), "flush must emit the pending speech");
+        assert!(!p.aggressive_redemption_active, "flush must restore base redemption");
+        assert_eq!(p.session.config_mut().redemption_time, Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn test_buffer_warning_is_throttled() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        assert!(!p.should_emit_buffer_warning(400_000), "below threshold: no warning");
+        assert!(p.should_emit_buffer_warning(520_000), "first crossing must warn");
+        assert!(!p.should_emit_buffer_warning(545_000), "same ~5s bucket: throttled");
+        assert!(!p.should_emit_buffer_warning(559_999), "still same bucket: throttled");
+        assert!(p.should_emit_buffer_warning(560_000), "next ~5s bucket: warn again");
     }
 
     #[test]
