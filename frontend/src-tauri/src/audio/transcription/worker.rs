@@ -597,17 +597,9 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
     }
 }
 
-/// Format current timestamp (wall-clock time)
+/// Format current timestamp (wall-clock time, local timezone)
 fn format_current_timestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-
-    let hours = (now.as_secs() / 3600) % 24;
-    let minutes = (now.as_secs() / 60) % 60;
-    let seconds = now.as_secs() % 60;
-
-    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 /// Format recording-relative time as [MM:SS]
