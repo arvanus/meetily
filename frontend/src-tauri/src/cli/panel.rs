@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn fit_record_only_tail_drops_in_segments_slot() {
-        // record_only: o slot de prioridade 2 é "recorded:" (não "segments:").
+        // record_only: o 2º campo descartado (slot de segments) é "recorded:".
         let s = PanelState { record_only: true, bytes_written: 2_097_152, engine_model: "m".into(), ..Default::default() };
         let wide = render_fit(&s, Some(200));
         assert!(wide.contains("recorded: 2.0 MB"));
