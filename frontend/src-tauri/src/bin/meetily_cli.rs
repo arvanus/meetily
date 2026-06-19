@@ -38,6 +38,20 @@ fn main() {
             tauri::async_runtime::block_on(runner::run_list_models(&handle))
                 .unwrap_or_else(|e| eprintln!("error: {e}"));
         }
+        Command::ListMeetings => {
+            tauri::async_runtime::block_on(runner::run_list_meetings(&handle))
+                .unwrap_or_else(|e| eprintln!("error: {e}"));
+        }
+        Command::ListTemplates => {
+            tauri::async_runtime::block_on(runner::run_list_templates())
+                .unwrap_or_else(|e| eprintln!("error: {e}"));
+        }
+        Command::Summarize(args) => {
+            if let Err(e) = tauri::async_runtime::block_on(runner::run_summarize(&handle, args)) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Record(args) => {
             if let Err(e) = tauri::async_runtime::block_on(runner::run_record(&handle, args)) {
                 eprintln!("error: {e}");

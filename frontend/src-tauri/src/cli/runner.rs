@@ -1,4 +1,4 @@
-use crate::cli::args::RecordArgs;
+use crate::cli::args::{RecordArgs, SummarizeArgs};
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
 use std::io::Write;
@@ -647,6 +647,223 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         println!("✓ Saved. meeting_id={} folder={}", meeting_id, folder_display);
     }
 
+    // record --summarize: encadeia o sumário da reunião recém-gravada.
+    // (validate() já garante !record_only quando summarize.) Falha aqui é apenas
+    // warn — a gravação já foi persistida, então o comando sai com sucesso.
+    if args.summarize {
+        match summarize_existing_meeting(app, meeting_id, args.template.clone()).await {
+            Ok(()) => println!("✓ Summary saved. meeting_id={}", meeting_id),
+            Err(e) => eprintln!(
+                "Warning: --summarize failed (the recording was saved): {}",
+                e
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// Lista as reuniões (id, data, título), mais recentes primeiro, para descobrir
+/// os ids usados em `summarize --meeting <id>`.
+pub async fn run_list_meetings(app: &tauri::AppHandle) -> Result<(), String> {
+    use crate::database::repositories::meeting::MeetingsRepository;
+
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+    let meetings = MeetingsRepository::get_meetings(&pool)
+        .await
+        .map_err(|e| format!("Failed to list meetings: {}", e))?;
+
+    if meetings.is_empty() {
+        println!("(none)");
+        return Ok(());
+    }
+    for m in meetings {
+        println!(
+            "{}  {}  {}",
+            m.id,
+            m.created_at.0.format("%Y-%m-%d %H:%M"),
+            m.title
+        );
+    }
+    Ok(())
+}
+
+/// Lista os templates de sumário disponíveis (built-in + custom): id, nome e
+/// descrição, para uso em `summarize --template <id>`.
+pub async fn run_list_templates() -> Result<(), String> {
+    let templates = crate::summary::templates::list_templates();
+    if templates.is_empty() {
+        println!("(none)");
+        return Ok(());
+    }
+    for (id, name, description) in templates {
+        println!("- {}  —  {}: {}", id, name, description);
+    }
+    Ok(())
+}
+
+/// Núcleo da geração de sumário pela CLI: espelha `api_process_transcript`, mas
+/// AGUARDA o processamento (em vez de `spawn`). Mostra um spinner com tempo
+/// decorrido enquanto o LLM trabalha e, ao final, lê o status persistido para
+/// confirmar (`completed`) ou propagar o erro do banco.
+pub async fn summarize_meeting(
+    app: &tauri::AppHandle,
+    meeting_id: &str,
+    text: String,
+    provider: String,
+    model: String,
+    template_id: String,
+) -> Result<(), String> {
+    use crate::database::repositories::summary::SummaryProcessesRepository;
+    use crate::database::repositories::transcript_chunk::TranscriptChunksRepository;
+    use crate::summary::service::SummaryService;
+
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    // (1) cria/zera o processo e (2) grava os chunks — igual a api_process_transcript.
+    SummaryProcessesRepository::create_or_reset_process(&pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to initialize the summary process: {}", e))?;
+
+    TranscriptChunksRepository::save_transcript_data(
+        &pool, meeting_id, &text, &provider, &model, 40000, 1000,
+    )
+    .await
+    .map_err(|e| format!("Failed to save transcript data: {}", e))?;
+
+    // Spinner com tempo decorrido (mesmo padrão da draw task do run_record).
+    let draw_handle = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let mut i = 0usize;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            let f = frames[i % frames.len()];
+            i += 1;
+            print!(
+                "\r\x1b[K{} Generating summary… {}s",
+                f,
+                started.elapsed().as_secs()
+            );
+            let _ = std::io::stdout().flush();
+        }
+    });
+
+    // Aguarda o processamento (persiste status/result no banco internamente).
+    SummaryService::process_transcript_background(
+        app.clone(),
+        pool.clone(),
+        meeting_id.to_string(),
+        text,
+        provider,
+        model,
+        template_id,
+    )
+    .await;
+
+    // Para o spinner e limpa a linha.
+    draw_handle.abort();
+    print!("\r\x1b[K");
+    let _ = std::io::stdout().flush();
+
+    // Confirma pelo status persistido.
+    match SummaryProcessesRepository::get_summary_data(&pool, meeting_id).await {
+        Ok(Some(p)) if p.status.to_lowercase() == "completed" => Ok(()),
+        Ok(Some(p)) => Err(p
+            .error
+            .unwrap_or_else(|| format!("summary did not complete (status: {})", p.status))),
+        Ok(None) => Err("summary process not found after generation.".to_string()),
+        Err(e) => Err(format!("failed to read the summary status: {}", e)),
+    }
+}
+
+/// Resolve transcript + template + provider/model de uma reunião EXISTENTE e
+/// gera o sumário. Compartilhado por `run_summarize` e por `record --summarize`.
+async fn summarize_existing_meeting(
+    app: &tauri::AppHandle,
+    meeting_id: &str,
+    template: Option<String>,
+) -> Result<(), String> {
+    use crate::database::repositories::{
+        meeting::MeetingsRepository, setting::SettingsRepository,
+    };
+
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    // Transcript concatenado. get_meeting devolve Err(RowNotFound) (não Ok(None))
+    // quando o id não existe — tratamos esse caso como "not found" amigável.
+    let details = match MeetingsRepository::get_meeting(&pool, meeting_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) | Err(sqlx::Error::RowNotFound) => {
+            return Err(format!("Meeting {} not found.", meeting_id))
+        }
+        Err(e) => return Err(format!("Failed to load the meeting: {}", e)),
+    };
+    let text = details
+        .transcripts
+        .iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return Err(
+            "This meeting has no transcript to summarize; re-transcribe it in the app."
+                .to_string(),
+        );
+    }
+
+    // Template (default = daily_standup); valida e, se inválido, lista os ids.
+    let template_id = template.unwrap_or_else(|| "daily_standup".to_string());
+    if crate::summary::templates::get_template(&template_id).is_err() {
+        let ids: Vec<String> = crate::summary::templates::list_templates()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        return Err(format!(
+            "Unknown template '{}'. Available: {}",
+            template_id,
+            ids.join(", ")
+        ));
+    }
+
+    // Provider/model SEMPRE da config do app (settings).
+    let (provider, model) = match SettingsRepository::get_model_config(&pool).await {
+        Ok(Some(s)) if !s.provider.is_empty() && !s.model.is_empty() => (s.provider, s.model),
+        _ => {
+            return Err(
+                "Summary model not configured. Configure it in the app first.".to_string(),
+            )
+        }
+    };
+
+    summarize_meeting(app, meeting_id, text, provider, model, template_id).await
+}
+
+/// Gera o sumário de uma reunião existente, escolhida por `--meeting <id>` ou
+/// `--last`. Só salva (banco + summary.md); não imprime o markdown.
+pub async fn run_summarize(app: &tauri::AppHandle, args: SummarizeArgs) -> Result<(), String> {
+    use crate::database::repositories::meeting::MeetingsRepository;
+
+    args.validate()?;
+
+    let meeting_id = if let Some(id) = args.meeting.clone() {
+        id
+    } else {
+        // --last: mais recente (get_meetings já ordena por created_at DESC).
+        let pool = app.state::<AppState>().db_manager.pool().clone();
+        let meetings = MeetingsRepository::get_meetings(&pool)
+            .await
+            .map_err(|e| format!("Failed to list meetings: {}", e))?;
+        meetings
+            .first()
+            .map(|m| m.id.clone())
+            .ok_or_else(|| "No meetings found.".to_string())?
+    };
+
+    summarize_existing_meeting(app, &meeting_id, args.template.clone()).await?;
+
+    println!("✓ Summary saved. meeting_id={}", meeting_id);
     Ok(())
 }
 

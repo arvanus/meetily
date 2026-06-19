@@ -15,6 +15,12 @@ pub enum Command {
     ListModels,
     /// List audio devices
     ListDevices,
+    /// List meetings (id, date, title) to discover meeting ids
+    ListMeetings,
+    /// List available summary templates (id, name, description)
+    ListTemplates,
+    /// Generate the summary of a meeting (reuses the app's summary pipeline)
+    Summarize(SummarizeArgs),
 }
 
 #[derive(clap::Args, Debug, Default, Clone)]
@@ -53,6 +59,12 @@ pub struct RecordArgs {
     /// Transcribe only, do not save the audio file (incompatible with --record-only)
     #[arg(long)]
     pub no_audio_save: bool,
+    /// After saving, generate the summary of the just-recorded meeting
+    #[arg(long)]
+    pub summarize: bool,
+    /// Template id used when --summarize is set (default: "daily_standup")
+    #[arg(long)]
+    pub template: Option<String>,
 }
 
 impl RecordArgs {
@@ -63,7 +75,40 @@ impl RecordArgs {
                     .to_string(),
             );
         }
+        if self.summarize && self.record_only {
+            return Err(
+                "--summarize needs a transcription; it is incompatible with --record-only."
+                    .to_string(),
+            );
+        }
         Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct SummarizeArgs {
+    /// Meeting id to summarize (use `list-meetings` to discover ids)
+    #[arg(long)]
+    pub meeting: Option<String>,
+    /// Summarize the most recent meeting instead of passing an id
+    #[arg(long)]
+    pub last: bool,
+    /// Template id (default: "daily_standup"); see `list-templates`
+    #[arg(long)]
+    pub template: Option<String>,
+}
+
+impl SummarizeArgs {
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.meeting.is_some(), self.last) {
+            (true, true) => {
+                Err("use either --meeting <id> or --last, not both.".to_string())
+            }
+            (false, false) => {
+                Err("specify the meeting to summarize: --meeting <id> or --last.".to_string())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -92,5 +137,50 @@ mod tests {
         let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
         assert!(args.validate().is_ok());
         assert!(args.record_only);
+    }
+
+    #[test]
+    fn summarize_requires_a_target() {
+        let cli = Cli::parse_from(["meetily-cli", "summarize"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn summarize_rejects_both_targets() {
+        let cli = Cli::parse_from(["meetily-cli", "summarize", "--meeting", "x", "--last"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn summarize_last_is_ok() {
+        let cli = Cli::parse_from(["meetily-cli", "summarize", "--last"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert!(args.validate().is_ok());
+        assert!(args.last);
+    }
+
+    #[test]
+    fn summarize_meeting_id_is_ok() {
+        let cli = Cli::parse_from(["meetily-cli", "summarize", "--meeting", "abc"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert!(args.validate().is_ok());
+        assert_eq!(args.meeting.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn record_summarize_with_record_only_is_rejected() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--summarize", "--record-only"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn record_summarize_alone_is_ok() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--summarize"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_ok());
+        assert!(args.summarize);
     }
 }
