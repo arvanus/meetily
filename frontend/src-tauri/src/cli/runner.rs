@@ -527,6 +527,10 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 } else {
                     0
                 };
+                // Margem de 1 coluna: escrever na última célula faz wrap de borda em
+                // alguns terminais — reservar evita reincidência do scroll infinito.
+                let cols = terminal_size::terminal_size()
+                    .map(|(terminal_size::Width(w), _)| (w as usize).saturating_sub(1));
                 let line = {
                     let Ok(mut p) = panel.lock() else { continue };
                     let elapsed = started.elapsed().as_secs();
@@ -542,7 +546,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                         silent_accum_ms = 0;
                     }
                     p.silent_secs = silent_accum_ms / 1000;
-                    crate::cli::panel::render(&p)
+                    crate::cli::panel::render_fit(&p, cols)
                 };
                 print!("\r\x1b[K{}", line);
                 let _ = std::io::stdout().flush();
