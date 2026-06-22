@@ -269,7 +269,7 @@ pub async fn generate_summary(
             result = request_future => {
                 result.map_err(|e| {
                     if e.is_timeout() {
-                        format!("LLM request timed out after 60 seconds")
+                        format!("LLM request timed out after {} seconds", REQUEST_TIMEOUT_DURATION.as_secs())
                     } else {
                         format!("Failed to send request to LLM: {}", e)
                     }
@@ -282,7 +282,7 @@ pub async fn generate_summary(
     } else {
         request_future.await.map_err(|e| {
             if e.is_timeout() {
-                format!("LLM request timed out after 60 seconds")
+                format!("LLM request timed out after {} seconds", REQUEST_TIMEOUT_DURATION.as_secs())
             } else {
                 format!("Failed to send request to LLM: {}", e)
             }

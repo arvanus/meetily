@@ -221,6 +221,11 @@ pub fn update_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 
 pub fn set_tray_state<R: Runtime>(app: &AppHandle<R>, state: RecordingState) {
     log::info!("Tray: Setting intermediate state: {:?}", state);
+    // See update_tray_menu_async: skip when no tray (headless CLI) — building a menu here
+    // would block a worker thread on the absent main-thread event loop.
+    if app.tray_by_id("main-tray").is_none() {
+        return;
+    }
     // During recording state transitions, we assume recording is allowed (we're already recording)
     if let Ok(menu) = build_menu(app, state, true) {
         if let Some(tray) = app.tray_by_id("main-tray") {
@@ -292,6 +297,18 @@ async fn check_can_record<R: Runtime>(app: &AppHandle<R>) -> bool {
 
 pub async fn update_tray_menu_async<R: Runtime>(app: &AppHandle<R>) {
     log::info!("Tray: update_tray_menu_async called");
+    // Headless mode (the CLI) builds the app WITHOUT registering a tray and never runs
+    // the Tauri event loop. Tauri menu/tray APIs (MenuItemBuilder::build, tray.set_menu)
+    // dispatch to the main thread via run_on_main_thread and BLOCK waiting for it to
+    // process the request — which never happens here, so the calling tokio worker thread
+    // blocks indefinitely. Enough of these (recording stop fires several) starve the
+    // multi-thread runtime's IO/time driver, freezing unrelated work like summary HTTP
+    // requests and timers. Skip entirely when no tray exists. `tray_by_id` only reads an
+    // in-memory map, so it is safe to call without the event loop.
+    if app.tray_by_id("main-tray").is_none() {
+        log::debug!("Tray: no tray registered (headless); skipping menu update");
+        return;
+    }
     // Get the current recording state
     let recording_state = get_current_recording_state().await;
     log::info!("Tray: Current recording state: {:?}", recording_state);
