@@ -14,6 +14,9 @@ pub struct PanelState {
     pub bytes_written: u64,
     pub silent_secs: u64,
     pub pulse_on: bool,
+    /// Gravação pausada (tecla 'p'): troca `● REC` por `⏸ PAUSED` e o runner
+    /// congela o tempo decorrido enquanto verdadeiro.
+    pub paused: bool,
 }
 
 fn bar(level: f32) -> char {
@@ -57,8 +60,12 @@ pub fn render(s: &PanelState) -> String {
 /// Sempre presentes (salvo truncação final com `…`): `● REC hh:mm:ss` e o
 /// aviso `⚠ no audio for Ns`. Com `max_cols = None`, devolve a linha completa.
 pub fn render_fit(s: &PanelState, max_cols: Option<usize>) -> String {
-    let dot = if s.pulse_on { '●' } else { '○' };
-    let rec = format!("{} REC {}", dot, hhmmss(s.elapsed_secs));
+    let rec = if s.paused {
+        format!("⏸ PAUSED {}", hhmmss(s.elapsed_secs))
+    } else {
+        let dot = if s.pulse_on { '●' } else { '○' };
+        format!("{} REC {}", dot, hhmmss(s.elapsed_secs))
+    };
     let eq = format!("eq {}{}{}", bar(s.bands[0]), bar(s.bands[1]), bar(s.bands[2]));
     let meters = format!(
         "mic {} sys {}",
@@ -169,6 +176,14 @@ mod tests {
         let speech = rms_to_level(0.05);
         assert!(speech > 0.4 && speech < 0.6, "speech level = {speech}");
         assert_eq!(rms_to_level(1.0), 1.0); // full scale enche tudo
+    }
+
+    #[test]
+    fn paused_shows_pause_state_not_rec() {
+        let s = PanelState { paused: true, elapsed_secs: 83, ..Default::default() };
+        let out = render(&s);
+        assert!(out.contains("⏸ PAUSED 00:01:23"));
+        assert!(!out.contains("REC"));
     }
 
     #[test]

@@ -2,8 +2,43 @@ use crate::cli::args::{RecordArgs, SummarizeArgs};
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
+
+/// Comando vindo da task de teclado (raw mode) para o loop async de gravação.
+enum KeyCmd {
+    /// Tecla 'p': alterna pause/resume.
+    TogglePause,
+    /// Ctrl+C ou 'q': encerra e salva.
+    Stop,
+}
+
+/// Habilita o raw mode do terminal e o RESTAURA no Drop (qualquer caminho de saída:
+/// fim normal, erro, panic). Em raw mode o Ctrl+C não gera mais o sinal do SO — por
+/// isso a task de teclado é quem sinaliza o stop. `enable` devolve None quando não há
+/// TTY de entrada (pipe/redirect) ou o raw mode falha: aí o runner cai no fluxo
+/// clássico (apenas Ctrl+C/--duration), sem mexer no terminal.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Option<Self> {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        match crossterm::terminal::enable_raw_mode() {
+            Ok(()) => Some(RawModeGuard),
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
 
 /// Constrói um app Tauri SEM janela. Reusa os mesmos State do app para que os
 /// comandos de gravação não entrem em pânico ao buscar `tauri::State`.
@@ -352,8 +387,10 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 if !quiet {
                     // Limpa a linha de status ANTES de rolar a linha do transcript,
                     // para que painel e texto não se sobreponham; a draw task
-                    // repinta o painel no próximo tick.
-                    print!("\r\x1b[K[{}] {}\n", u.timestamp, u.text);
+                    // repinta o painel no próximo tick. Usamos \r\n (não só \n):
+                    // sob raw mode o terminal não traduz \n em CR+LF, então sem o
+                    // \r as linhas sairiam em escada.
+                    print!("\r\x1b[K[{}] {}\r\n", u.timestamp, u.text);
                     let _ = std::io::stdout().flush();
                 }
                 // O formato esperado por api_save_transcript é o
@@ -499,18 +536,26 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         folder_path.clone().unwrap_or_else(|| "(folder to be created)".into())
     );
 
-    println!("Recording. Press Ctrl+C to stop and save.");
+    println!("Recording. Press 'p' to pause/resume, Ctrl+C (or 'q') to stop and save.");
 
     // Draw task do painel vivo: redesenha ~4x/s na própria linha, sempre (mesmo com
     // --quiet; quiet só esconde o texto dos transcripts). Toggla o ponto a cada ~1s e
     // rastreia silêncio (mic+sis abaixo de 0.01) para o alerta.
+    // Flag de pausa compartilhada entre a task de teclado (quem alterna) e a draw
+    // task (que congela o tempo enquanto pausado).
+    let paused = Arc::new(AtomicBool::new(false));
+
     let draw_handle = {
         let panel = panel.clone();
         let record_only = args.record_only;
         let folder_for_bytes = folder_path.clone();
+        let paused = paused.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let mut silent_accum_ms: u64 = 0;
+            // Tempo total pausado (250ms por tick em pausa): subtraído do elapsed
+            // para o cronômetro do painel congelar durante a pausa.
+            let mut paused_accum_ms: u64 = 0;
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
@@ -531,16 +576,29 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 // alguns terminais — reservar evita reincidência do scroll infinito.
                 let cols = terminal_size::terminal_size()
                     .map(|(terminal_size::Width(w), _)| (w as usize).saturating_sub(1));
+                let is_paused = paused.load(Ordering::SeqCst);
+                if is_paused {
+                    paused_accum_ms = paused_accum_ms.saturating_add(250);
+                }
                 let line = {
                     let Ok(mut p) = panel.lock() else { continue };
-                    let elapsed = started.elapsed().as_secs();
+                    p.paused = is_paused;
+                    // Congela o cronômetro durante a pausa subtraindo o tempo pausado.
+                    let elapsed = started
+                        .elapsed()
+                        .as_secs()
+                        .saturating_sub(paused_accum_ms / 1000);
                     p.elapsed_secs = elapsed;
                     p.pulse_on = (elapsed % 2) == 0;
                     if record_only {
                         p.bytes_written = bytes;
                     }
-                    // Silêncio: acumula 250ms por tick quando ambos rms < 0.01.
-                    if p.mic_rms < 0.01 && p.system_rms < 0.01 {
+                    // Silêncio: acumula 250ms por tick quando ambos rms < 0.01. Em
+                    // pausa não há áudio por definição — zera para não disparar o
+                    // alerta de "no audio".
+                    if is_paused {
+                        silent_accum_ms = 0;
+                    } else if p.mic_rms < 0.01 && p.system_rms < 0.01 {
                         silent_accum_ms = silent_accum_ms.saturating_add(250);
                     } else {
                         silent_accum_ms = 0;
@@ -554,8 +612,100 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         })
     };
 
-    // Aguarda Ctrl+C ou o tempo de --duration.
-    wait_for_stop(args.duration).await;
+    // Pause/resume ao vivo: tecla 'p' alterna; Ctrl+C ou 'q' encerra. Lemos o teclado
+    // char-a-char (raw mode), igual ao botão de pausa da GUI. Sem TTY (pipe/redirect),
+    // `RawModeGuard::enable` devolve None e caímos no fluxo clássico (Ctrl+C/--duration).
+    match RawModeGuard::enable() {
+        Some(raw_guard) => {
+            // Task de teclado (blocking) → loop async via canal. O poll com timeout
+            // permite encerrar a task assim que `stop_keys` for setado.
+            let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyCmd>();
+            let stop_keys = Arc::new(AtomicBool::new(false));
+            let key_handle = {
+                let stop_keys = stop_keys.clone();
+                tokio::task::spawn_blocking(move || {
+                    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+                    loop {
+                        if stop_keys.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        match event::poll(std::time::Duration::from_millis(200)) {
+                            Ok(true) => {
+                                if let Ok(Event::Key(k)) = event::read() {
+                                    // Windows emite Press E Release; só agimos no Press.
+                                    if k.kind != KeyEventKind::Press {
+                                        continue;
+                                    }
+                                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                                    match k.code {
+                                        KeyCode::Char('c') if ctrl => {
+                                            let _ = key_tx.send(KeyCmd::Stop);
+                                            break;
+                                        }
+                                        KeyCode::Char('p') | KeyCode::Char('P') if !ctrl => {
+                                            let _ = key_tx.send(KeyCmd::TogglePause);
+                                        }
+                                        KeyCode::Char('q') | KeyCode::Char('Q') if !ctrl => {
+                                            let _ = key_tx.send(KeyCmd::Stop);
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+
+            // Espera: --duration OU um comando da task de teclado.
+            let sleep = async {
+                match args.duration {
+                    Some(secs) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(secs)).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    cmd = key_rx.recv() => match cmd {
+                        None | Some(KeyCmd::Stop) => break,
+                        Some(KeyCmd::TogglePause) => {
+                            let want_paused = !paused.load(Ordering::SeqCst);
+                            let res = if want_paused {
+                                crate::audio::recording_commands::pause_recording(app.clone()).await
+                            } else {
+                                crate::audio::recording_commands::resume_recording(app.clone()).await
+                            };
+                            match res {
+                                Ok(()) => paused.store(want_paused, Ordering::SeqCst),
+                                // Não derruba a gravação; só avisa (raro: corrida de estado).
+                                Err(e) => {
+                                    print!("\r\x1b[K⚠ pause/resume failed: {}\r\n", e);
+                                    let _ = std::io::stdout().flush();
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+
+            // Encerra a task de teclado e RESTAURA o terminal ANTES dos prints de
+            // shutdown (que usam \n e precisam do terminal em modo cozido de volta).
+            stop_keys.store(true, Ordering::SeqCst);
+            let _ = key_handle.await;
+            drop(raw_guard);
+        }
+        None => {
+            // Sem TTY: comportamento clássico, sem pause.
+            wait_for_stop(args.duration).await;
+        }
+    }
 
     // Para a draw task e abre uma nova linha para o que vem a seguir.
     draw_handle.abort();

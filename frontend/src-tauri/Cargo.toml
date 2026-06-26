@@ -89,7 +89,10 @@ clap = { version = "4.3", features = ["derive"] }
 chrono = { version = "0.4.31", features = ["serde"] }
 
 # Largura do terminal para o painel CLI adaptativo (evita wrap/scroll infinito)
-terminal-size = "0.4"
+terminal_size = "0.4"
+
+# Leitura de tecla em raw mode (char-a-char, sem Enter) para pause/resume no CLI
+crossterm = "0.28"
 
 # Log
 log = "0.4"
