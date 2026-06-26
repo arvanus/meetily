@@ -10,6 +10,9 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Record a meeting (default subcommand)
+    ///
+    /// Hotkeys while recording: press 'p' to pause/resume, Ctrl+C (or 'q') to
+    /// stop and save.
     Record(RecordArgs),
     /// List available transcription models and the configured default
     ListModels,
