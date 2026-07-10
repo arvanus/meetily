@@ -1,6 +1,7 @@
 use app_lib::cli::args::{Cli, Command, RecordArgs};
 use app_lib::cli::runner;
 use clap::Parser;
+use tauri::Manager;
 
 fn main() {
     // Logs do framework são ruído no CLI: a transcrição ao vivo e o painel usam stdout
@@ -27,6 +28,16 @@ fn main() {
     // Resolve os diretórios de modelos a partir do AppHandle antes de usar os comandos.
     app_lib::whisper_engine::commands::set_models_directory(&handle);
     app_lib::parakeet_engine::commands::set_models_directory(&handle);
+
+    // build_headless_app() only calls .build(), not .run() — lib.rs's setup() (which
+    // registers the templates dir via resource_dir) never fires. Without this,
+    // list-templates only sees the 2 templates hardcoded in defaults.rs.
+    if let Ok(resource_path) = handle.path().resource_dir() {
+        let templates_dir = resource_path.join("templates");
+        app_lib::summary::templates::set_bundled_templates_dir(templates_dir);
+    } else {
+        log::warn!("Failed to resolve resource directory for templates");
+    }
 
     // Sem subcomando = gravar com a config padrão do app (Record é o default).
     match cli.command.unwrap_or(Command::Record(RecordArgs::default())) {
