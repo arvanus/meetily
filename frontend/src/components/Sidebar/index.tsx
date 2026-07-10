@@ -31,6 +31,11 @@ import Info from '../Info';
 import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group';
+import { Button } from '../ui/button';
+import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
+import { Calendar as CalendarPicker } from '../ui/calendar';
+import type { DateRange } from 'react-day-picker';
+import { isWithinInterval, startOfDay, endOfDay, isSameDay, format } from 'date-fns';
 
 interface SidebarItem {
   id: string;
@@ -63,6 +68,8 @@ const Sidebar: React.FC = () => {
   const { betaFeatures } = useConfig();
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined);
+  const [isDatePopoverOpen, setIsDatePopoverOpen] = useState(false);
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'ollama',
@@ -255,67 +262,57 @@ const Sidebar: React.FC = () => {
     }
   }, [expandedFolders, searchTranscripts]);
 
-  // Combine search results with sidebar items
+  // Map meeting id -> creation date, used by the date-range filter and the calendar's "has records" dots
+  const meetingDateById = useMemo(() => {
+    const map = new Map<string, Date>();
+    meetings.forEach(meeting => {
+      if (meeting.created_at) map.set(meeting.id, new Date(meeting.created_at));
+    });
+    return map;
+  }, [meetings]);
+
+  const recordDates = useMemo(() => Array.from(meetingDateById.values()), [meetingDateById]);
+
+  const isWithinDateRange = useCallback((meetingId: string) => {
+    if (!dateRange?.from) return true;
+    const date = meetingDateById.get(meetingId);
+    if (!date) return true; // unknown date (e.g. 'intro-call'): don't hide it
+    const from = startOfDay(dateRange.from);
+    const to = endOfDay(dateRange.to ?? dateRange.from);
+    return isWithinInterval(date, { start: from, end: to });
+  }, [dateRange, meetingDateById]);
+
+  // Combine text search and date-range filtering with sidebar items
   const filteredSidebarItems = useMemo(() => {
-    if (!searchQuery.trim()) return sidebarItems;
+    const hasTextQuery = !!searchQuery.trim();
+    const hasDateFilter = !!dateRange?.from;
+    if (!hasTextQuery && !hasDateFilter) return sidebarItems;
 
-    // If we have search results, highlight matching meetings
-    if (searchResults.length > 0) {
-      // Get the IDs of meetings that matched in transcripts
-      const matchedMeetingIds = new Set(searchResults.map(result => result.id));
+    // IDs of meetings that matched in transcript content search
+    const matchedMeetingIds = hasTextQuery && searchResults.length > 0
+      ? new Set(searchResults.map(result => result.id))
+      : null;
 
-      return sidebarItems
-        .map(folder => {
-          // Always include folders in the results
-          if (folder.type === 'folder') {
-            if (!folder.children) return folder;
+    const matchesItem = (item: SidebarItem) => {
+      const matchesText = !hasTextQuery ||
+        matchedMeetingIds?.has(item.id) ||
+        item.title.toLowerCase().includes(searchQuery.toLowerCase());
+      return matchesText && isWithinDateRange(item.id);
+    };
 
-            // Filter children based on search results or title match
-            const filteredChildren = folder.children.filter(item => {
-              // Include if the meeting ID is in our search results
-              if (matchedMeetingIds.has(item.id)) return true;
+    return sidebarItems
+      .map(folder => {
+        // Always include folders in the results
+        if (folder.type === 'folder') {
+          if (!folder.children) return folder;
+          return { ...folder, children: folder.children.filter(matchesItem) };
+        }
 
-              // Or if the title matches the search query
-              return item.title.toLowerCase().includes(searchQuery.toLowerCase());
-            });
-
-            return {
-              ...folder,
-              children: filteredChildren
-            };
-          }
-
-          // For non-folder items, check if they match the search
-          return (matchedMeetingIds.has(folder.id) ||
-            folder.title.toLowerCase().includes(searchQuery.toLowerCase()))
-            ? folder : undefined;
-        })
-        .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
-    } else {
-      // Fall back to title-only filtering if no transcript results
-      return sidebarItems
-        .map(folder => {
-          // Always include folders in the results
-          if (folder.type === 'folder') {
-            if (!folder.children) return folder;
-
-            // Filter children based on search query
-            const filteredChildren = folder.children.filter(item =>
-              item.title.toLowerCase().includes(searchQuery.toLowerCase())
-            );
-
-            return {
-              ...folder,
-              children: filteredChildren
-            };
-          }
-
-          // For non-folder items, check if they match the search
-          return folder.title.toLowerCase().includes(searchQuery.toLowerCase()) ? folder : undefined;
-        })
-        .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
-    }
-  }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
+        // For non-folder items, check if they match the filters
+        return matchesItem(folder) ? folder : undefined;
+      })
+      .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
+  }, [sidebarItems, searchQuery, searchResults, dateRange, isWithinDateRange]);
 
 
   const handleDelete = async (itemId: string) => {
@@ -712,6 +709,50 @@ const Sidebar: React.FC = () => {
                       </InputGroupAddon>
                     }
                   </InputGroup>
+                </div>
+
+                <div className="relative mb-1 flex items-center gap-1">
+                  <Popover open={isDatePopoverOpen} onOpenChange={setIsDatePopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="flex-1 justify-start text-left font-normal text-gray-600 h-9 min-w-0"
+                      >
+                        <Calendar className="w-4 h-4 mr-2 shrink-0" />
+                        <span className="truncate">
+                          {dateRange?.from
+                            ? dateRange.to && !isSameDay(dateRange.from, dateRange.to)
+                              ? `${format(dateRange.from, 'dd/MM/yy')} - ${format(dateRange.to, 'dd/MM/yy')}`
+                              : format(dateRange.from, 'dd/MM/yy')
+                            : 'Filter by date'}
+                        </span>
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-auto p-0" align="start">
+                      <CalendarPicker
+                        mode="range"
+                        selected={dateRange}
+                        onSelect={setDateRange}
+                        defaultMonth={dateRange?.from ?? recordDates[0]}
+                        modifiers={{ hasRecord: recordDates }}
+                        modifiersClassNames={{
+                          hasRecord:
+                            "[&>button]:relative [&>button]:after:content-[''] [&>button]:after:absolute [&>button]:after:bottom-1 [&>button]:after:left-1/2 [&>button]:after:-translate-x-1/2 [&>button]:after:size-1 [&>button]:after:rounded-full [&>button]:after:bg-blue-500",
+                        }}
+                      />
+                    </PopoverContent>
+                  </Popover>
+                  {dateRange?.from && (
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="h-9 w-9 shrink-0 text-gray-600"
+                      onClick={() => setDateRange(undefined)}
+                    >
+                      <X className="w-4 h-4" />
+                    </Button>
+                  )}
                 </div>
               </div>
             )}
