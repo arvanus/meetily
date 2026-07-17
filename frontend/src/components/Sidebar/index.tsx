@@ -36,13 +36,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { Calendar as CalendarPicker } from '../ui/calendar';
 import type { DateRange } from 'react-day-picker';
 import { isWithinInterval, startOfDay, endOfDay, isSameDay, format } from 'date-fns';
-
-interface SidebarItem {
-  id: string;
-  title: string;
-  type: 'folder' | 'file';
-  children?: SidebarItem[];
-}
+import { groupMeetingsByDay, parseMeetingDate, type SidebarItem } from './meetingGroups';
 
 const Sidebar: React.FC = () => {
   const router = useRouter();
@@ -262,11 +256,12 @@ const Sidebar: React.FC = () => {
     }
   }, [expandedFolders, searchTranscripts]);
 
-  // Map meeting id -> creation date, used by the date-range filter and the calendar's "has records" dots
+  // Map meeting id -> creation date, used by the date-range filter, the day groups and the calendar's "has records" dots
   const meetingDateById = useMemo(() => {
     const map = new Map<string, Date>();
     meetings.forEach(meeting => {
-      if (meeting.created_at) map.set(meeting.id, new Date(meeting.created_at));
+      const date = parseMeetingDate(meeting.created_at);
+      if (date) map.set(meeting.id, date);
     });
     return map;
   }, [meetings]);
@@ -313,6 +308,15 @@ const Sidebar: React.FC = () => {
       })
       .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
   }, [sidebarItems, searchQuery, searchResults, dateRange, isWithinDateRange]);
+
+  // Meetings grouped under day headers. Built from the filtered items, so the headers
+  // follow the search and the date-range filter instead of showing every day.
+  const meetingGroups = useMemo(() => {
+    const items = filteredSidebarItems.flatMap(item =>
+      item.type === 'folder' ? item.children ?? [] : [item]
+    );
+    return groupMeetingsByDay(items, meetingDateById, new Date());
+  }, [filteredSidebarItems, meetingDateById]);
 
 
   const handleDelete = async (itemId: string) => {
@@ -558,6 +562,9 @@ const Sidebar: React.FC = () => {
     const matchingResult = isMeetingItem ? findMatchingSnippet(item.id) : null;
     const hasTranscriptMatch = !!matchingResult;
 
+    // The day group header carries the date, so the row only needs the time
+    const meetingDate = isMeetingItem ? meetingDateById.get(item.id) : undefined;
+
     if (isCollapsed) return null;
 
     return (
@@ -613,6 +620,11 @@ const Sidebar: React.FC = () => {
                   </div>
                 )}
                 <span className="flex-1 break-words">{item.title}</span>
+                {meetingDate && (
+                  <span className={`ml-2 shrink-0 text-xs tabular-nums ${isActive ? 'text-blue-500' : 'text-gray-400'}`}>
+                    {format(meetingDate, 'HH:mm')}
+                  </span>
+                )}
                 {isMeetingItem && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                     <button
@@ -754,6 +766,10 @@ const Sidebar: React.FC = () => {
                     </Button>
                   )}
                 </div>
+
+                {searchQuery && isSearching && (
+                  <div className="px-1 text-xs text-blue-500 animate-pulse">Searching...</div>
+                )}
               </div>
             )}
           </div>
@@ -777,35 +793,23 @@ const Sidebar: React.FC = () => {
           {/* Content area */}
           <div className="flex-1 flex flex-col min-h-0">
             {renderCollapsedIcons()}
-            {/* Meeting Notes folder header - fixed */}
+
+            {/* Scrollable meeting items, grouped by day */}
             {!isCollapsed && (
-              <div className="flex-shrink-0">
-                {filteredSidebarItems.filter(item => item.type === 'folder').map(item => (
-                  <div key={item.id}>
-                    <div
-                      className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg"
-                    >
-                      <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
-                      <span className="text-gray-700">{item.title}</span>
-                      {searchQuery && item.id === 'meetings' && isSearching && (
-                        <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
-                      )}
+              <div className="flex-1 overflow-y-auto custom-scrollbar min-h-0 mt-3">
+                {meetingGroups.map(group => (
+                  <div key={group.key} className="mx-3">
+                    <div className="px-3 pt-2 pb-0.5 text-xs font-medium text-gray-400">
+                      {group.label}
                     </div>
+                    {group.items.map(item => renderItem(item, 1))}
                   </div>
                 ))}
-              </div>
-            )}
-
-            {/* Scrollable meeting items */}
-            {!isCollapsed && (
-              <div className="flex-1 overflow-y-auto custom-scrollbar min-h-0">
-                {filteredSidebarItems
-                  .filter(item => item.type === 'folder' && expandedFolders.has(item.id) && item.children)
-                  .map(item => (
-                    <div key={`${item.id}-children`} className="mx-3">
-                      {item.children!.map(child => renderItem(child, 1))}
-                    </div>
-                  ))}
+                {meetingGroups.length === 0 && (
+                  <div className="mx-6 text-xs text-gray-400">
+                    {searchQuery || dateRange?.from ? 'No meetings match your filters' : 'No meetings yet'}
+                  </div>
+                )}
               </div>
             )}
           </div>
