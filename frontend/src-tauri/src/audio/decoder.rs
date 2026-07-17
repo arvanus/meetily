@@ -2,7 +2,7 @@
 // Uses Symphonia to decode MP4/AAC audio files, with ffmpeg fallback for
 // formats Symphonia can't handle (MKV, WebM, WMA)
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -21,6 +21,16 @@ use super::ffmpeg::find_ffmpeg_path;
 
 /// Extensions requiring ffmpeg pre-conversion (Symphonia lacks these demuxers/codecs)
 const FFMPEG_ONLY_EXTENSIONS: &[&str] = &["mkv", "webm", "wma"];
+
+/// Check if an error is caused by Symphonia not supporting the codec (e.g. Opus in OGG).
+/// Uses typed error chain inspection instead of fragile string matching.
+fn is_unsupported_codec_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<symphonia::core::errors::Error>()
+            .is_some_and(|e| matches!(e, symphonia::core::errors::Error::Unsupported(_)))
+    })
+}
 
 /// Progress callback for long-running operations
 /// Returns current progress (0-100) and a message
@@ -424,6 +434,72 @@ fn convert_to_wav_with_ffmpeg(
     Ok(temp_path)
 }
 
+/// Attempt to probe and create a Symphonia decoder for the given audio file.
+/// Returns the format reader, track info, and decoder on success.
+fn try_symphonia_decode(
+    path: &Path,
+) -> Result<(
+    Box<dyn symphonia::core::formats::FormatReader>,
+    u32,
+    u32,
+    u16,
+    Option<u64>,
+    Box<dyn symphonia::core::codecs::Decoder>,
+)> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("Failed to open audio file '{}': {}", path.display(), e))?;
+
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .context("Failed to probe audio format")?;
+
+    let mut format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| anyhow!("No audio track found in file"))?;
+
+    let track_id = track.id;
+
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| anyhow!("Unknown sample rate"))?;
+
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(1);
+
+    debug!(
+        "Audio track: {}Hz, {} channels (from metadata)",
+        sample_rate, channels
+    );
+
+    let n_frames = track.codec_params.n_frames;
+
+    let decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("Failed to create decoder")?;
+
+    Ok((format, track_id, sample_rate, channels, n_frames, decoder))
+}
+
 /// Decode an audio file (MP4, M4A, WAV, etc.) to raw samples
 pub fn decode_audio_file(path: &Path) -> Result<DecodedAudio> {
     decode_audio_file_with_progress(path, None)
@@ -456,67 +532,40 @@ pub fn decode_audio_file_with_progress(
             (None, Cow::Borrowed(path))
         };
 
-    // Open the file (use decode_path which may be the temp WAV)
-    let file = std::fs::File::open(decode_path.as_ref())
-        .map_err(|e| anyhow!("Failed to open audio file '{}': {}", decode_path.display(), e))?;
+    // Try Symphonia decoding first; if the codec is unsupported, fall back to FFmpeg conversion.
+    let result = try_symphonia_decode(decode_path.as_ref());
 
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let (_ffmpeg_fallback_guard, decode_path, result) = match result {
+        Err(ref e) if is_unsupported_codec_error(e) && !needs_ffmpeg_conversion(path) => {
+            info!(
+                "Symphonia cannot decode codec in .{} file, falling back to FFmpeg conversion",
+                path.extension().and_then(|e| e.to_str()).unwrap_or("unknown")
+            );
+            match convert_to_wav_with_ffmpeg(path, progress_callback.as_ref()) {
+                Ok(temp_path) => {
+                    let wav_path = temp_path.to_path_buf();
+                    let fallback_result = try_symphonia_decode(&wav_path);
+                    (Some(temp_path), Cow::Owned(wav_path), fallback_result)
+                }
+                Err(ffmpeg_err) => {
+                    return Err(anyhow!(
+                        "Symphonia cannot decode this codec and FFmpeg fallback failed: {}",
+                        ffmpeg_err
+                    ));
+                }
+            }
+        }
+        other => (None, decode_path, other),
+    };
 
-    // Set up format hint based on file extension
-    let mut hint = Hint::new();
-    if let Some(ext) = decode_path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    // Probe the file format
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| anyhow!("Failed to probe audio format: {}", e))?;
-
-    let mut format = probed.format;
-
-    // Find the first audio track
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or_else(|| anyhow!("No audio track found in file"))?;
-
-    let track_id = track.id;
-
-    // Get audio parameters
-    let sample_rate = track
-        .codec_params
-        .sample_rate
-        .ok_or_else(|| anyhow!("Unknown sample rate"))?;
-
-    let mut channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count() as u16)
-        .unwrap_or(1);
-
-    debug!(
-        "Audio track: {}Hz, {} channels (from metadata)",
-        sample_rate, channels
-    );
-
-    // Create the decoder
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| anyhow!("Failed to create decoder: {}", e))?;
+    let (mut format, track_id, sample_rate, mut channels, n_frames, mut decoder) = result?;
 
     // Decode all packets
     let mut all_samples: Vec<f32> = Vec::new();
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     // Calculate expected samples for progress tracking
-    let expected_duration = track.codec_params.n_frames
+    let expected_duration = n_frames
         .map(|frames| frames as f64 / sample_rate as f64);
     let expected_samples = expected_duration
         .map(|dur| (dur * sample_rate as f64 * channels as f64) as usize);
