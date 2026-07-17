@@ -21,16 +21,17 @@ import { TranscriptRecovery } from '@/components/TranscriptRecovery';
 import { indexedDBService } from '@/services/indexedDBService';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
-import { Loader2 } from 'lucide-react';
+import { Loader2, NotebookPen, X } from 'lucide-react';
 
 export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
   const [barHeights, setBarHeights] = useState(['10%', '10%', '10%']);
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
+  const [showLiveNotes, setShowLiveNotes] = useState(false);
 
   // Use contexts for state management
-  const { meetingTitle } = useTranscripts();
+  const { meetingTitle, liveContext, setLiveContext } = useTranscripts();
   const { transcriptModelConfig, selectedDevices } = useConfig();
   const recordingState = useRecordingState();
 
@@ -283,6 +284,38 @@ export default function Home() {
                     </motion.div>
                   )}
                 </AnimatePresence>
+
+                {/* Live details/observations — flushed into the meeting's AI summary context on stop */}
+                <AnimatePresence>
+                  {recordingState.isRecording && showLiveNotes && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 10 }}
+                      className="mb-2 w-2/3 max-w-[750px]"
+                    >
+                      <div className="bg-white rounded-2xl shadow-lg p-3">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-xs font-medium text-gray-500">Details / observations</span>
+                          <button
+                            onClick={() => setShowLiveNotes(false)}
+                            className="text-gray-400 hover:text-gray-600 transition-colors"
+                            aria-label="Hide notes"
+                          >
+                            <X className="h-4 w-4" />
+                          </button>
+                        </div>
+                        <textarea
+                          value={liveContext}
+                          onChange={(e) => setLiveContext(e.target.value)}
+                          placeholder="Notes for the AI summary — people involved, decisions, follow-ups…"
+                          className="w-full px-3 py-2 border border-gray-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 bg-white min-h-[80px] resize-y"
+                        />
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 <div className="w-2/3 max-w-[750px] flex justify-center">
                   <div className="bg-white rounded-full shadow-lg flex items-center">
                     <RecordingControls
@@ -300,6 +333,20 @@ export default function Home() {
                       selectedDevices={selectedDevices}
                       meetingName={meetingTitle}
                     />
+                    {recordingState.isRecording && (
+                      <button
+                        onClick={() => setShowLiveNotes((v) => !v)}
+                        className={`w-10 h-10 mr-3 flex items-center justify-center rounded-full transition-colors ${
+                          showLiveNotes || liveContext.trim()
+                            ? 'text-blue-600 bg-blue-50 hover:bg-blue-100'
+                            : 'text-gray-500 hover:bg-gray-100'
+                        }`}
+                        title="Details / observations"
+                        aria-label="Toggle details / observations"
+                      >
+                        <NotebookPen size={18} />
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>

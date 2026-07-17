@@ -17,6 +17,9 @@ interface TranscriptContextType {
   transcriptContainerRef: React.RefObject<HTMLDivElement>;
   meetingTitle: string;
   setMeetingTitle: (title: string) => void;
+  /** Details/observations typed during recording; flushed to the meeting's AI summary context on stop */
+  liveContext: string;
+  setLiveContext: (value: string) => void;
   clearTranscripts: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
@@ -29,6 +32,7 @@ const TranscriptContext = createContext<TranscriptContextType | undefined>(undef
 export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
+  const [liveContext, setLiveContext] = useState('');
   const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
   const [partialText, setPartialText] = useState<string | null>(null);
 
@@ -492,6 +496,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const clearTranscripts = useCallback(() => {
     setTranscripts([]);
     setPartialText(null);
+    setLiveContext('');
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -527,6 +532,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     transcriptContainerRef,
     meetingTitle,
     setMeetingTitle,
+    liveContext,
+    setLiveContext,
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,

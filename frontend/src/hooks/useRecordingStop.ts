@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -52,6 +53,7 @@ export function useRecordingStop(
     flushBuffer,
     clearTranscripts,
     meetingTitle,
+    liveContext,
     markMeetingAsSaved,
   } = useTranscripts();
 
@@ -265,6 +267,25 @@ export function useRecordingStop(
           console.log('   Transcripts:', freshTranscripts.length);
           console.log('   folder_path:', folderPath);
 
+          // Flush details/observations typed during recording into the meeting's
+          // AI summary context (same field editable later on the meeting details page).
+          const trimmedContext = liveContext.trim();
+          if (trimmedContext) {
+            try {
+              await invoke('api_save_summary_context', {
+                meetingId,
+                contextPrompt: trimmedContext,
+              });
+              console.log('✅ Saved live details/observations to summary context');
+            } catch (contextError) {
+              // Non-fatal: the meeting is already saved; just warn the user.
+              console.error('Failed to save live details/observations:', contextError);
+              toast.warning('Meeting saved, but details/observations could not be saved', {
+                description: String(contextError),
+              });
+            }
+          }
+
           // Mark meeting as saved in IndexedDB (for recovery system)
           await markMeetingAsSaved();
 
@@ -400,6 +421,7 @@ export function useRecordingStop(
     flushBuffer,
     clearTranscripts,
     meetingTitle,
+    liveContext,
     markMeetingAsSaved,
     refetchMeetings,
     setCurrentMeeting,

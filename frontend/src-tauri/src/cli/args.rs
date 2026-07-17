@@ -31,6 +31,10 @@ pub struct RecordArgs {
     /// Meeting name (default: "CLI Meeting <date/time>")
     #[arg(long)]
     pub name: Option<String>,
+    /// Seed details/observations for the AI summary context; while recording press
+    /// 'n' to append more lines live. Saved to the meeting on stop.
+    #[arg(long)]
+    pub notes: Option<String>,
     /// Record WITHOUT loading AI (minimal RAM); re-transcribe later in the app
     #[arg(long)]
     pub record_only: bool,
@@ -132,6 +136,13 @@ mod tests {
         let cli = Cli::parse_from(["meetily-cli", "record", "--language", "pt"]);
         let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
         assert_eq!(args.language.as_deref(), Some("pt"));
+    }
+
+    #[test]
+    fn notes_flag_is_parsed() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--notes", "kickoff call"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert_eq!(args.notes.as_deref(), Some("kickoff call"));
     }
 
     #[test]

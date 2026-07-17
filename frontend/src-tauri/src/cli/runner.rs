@@ -536,7 +536,14 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         folder_path.clone().unwrap_or_else(|| "(folder to be created)".into())
     );
 
-    println!("Recording. Press 'p' to pause/resume, Ctrl+C (or 'q') to stop and save.");
+    println!("Recording. Press 'p' to pause/resume, 'n' to add a note, Ctrl+C (or 'q') to stop and save.");
+
+    // Details/observations buffer: seeded by --notes, appended live with the 'n' key,
+    // and flushed into the meeting's AI summary context on stop (same field the app
+    // shows on the meeting details page). `entering_note` freezes the live panel while
+    // the user types a note so the prompt is not clobbered by the redraw.
+    let notes = Arc::new(Mutex::new(args.notes.clone().unwrap_or_default()));
+    let entering_note = Arc::new(AtomicBool::new(false));
 
     // Draw task do painel vivo: redesenha ~4x/s na própria linha, sempre (mesmo com
     // --quiet; quiet só esconde o texto dos transcripts). Toggla o ponto a cada ~1s e
@@ -550,6 +557,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         let record_only = args.record_only;
         let folder_for_bytes = folder_path.clone();
         let paused = paused.clone();
+        let entering_note = entering_note.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let mut silent_accum_ms: u64 = 0;
@@ -560,6 +568,11 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                 tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
                 interval.tick().await;
+                // Enquanto o usuário digita uma nota ('n'), congela o painel para não
+                // sobrescrever o prompt "note>" na mesma linha.
+                if entering_note.load(Ordering::SeqCst) {
+                    continue;
+                }
                 // Em --record-only, o painel mostra "gravado: X MB". Sob auto_save,
                 // o áudio é escrito incrementalmente em .checkpoints/ dentro da
                 // pasta da reunião, então somamos o tamanho dos arquivos da pasta
@@ -623,6 +636,8 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
             let stop_keys = Arc::new(AtomicBool::new(false));
             let key_handle = {
                 let stop_keys = stop_keys.clone();
+                let notes_kb = notes.clone();
+                let entering_note_kb = entering_note.clone();
                 tokio::task::spawn_blocking(move || {
                     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
                     loop {
@@ -648,6 +663,88 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                                         KeyCode::Char('q') | KeyCode::Char('Q') if !ctrl => {
                                             let _ = key_tx.send(KeyCmd::Stop);
                                             break;
+                                        }
+                                        KeyCode::Char('n') | KeyCode::Char('N') if !ctrl => {
+                                            // Captura uma linha de nota inline (raw mode não
+                                            // ecoa; ecoamos char a char). Congela o painel via
+                                            // `entering_note` enquanto o usuário digita.
+                                            entering_note_kb.store(true, Ordering::SeqCst);
+                                            print!("\r\x1b[Knote> ");
+                                            let _ = std::io::stdout().flush();
+                                            let mut buf = String::new();
+                                            let mut abort_stop = false;
+                                            loop {
+                                                // Aborta a nota se um stop foi pedido enquanto
+                                                // digita (ex.: --duration expira), senão o
+                                                // `key_handle.await` do stop travaria aqui.
+                                                if stop_keys.load(Ordering::SeqCst) {
+                                                    buf.clear();
+                                                    break;
+                                                }
+                                                match event::poll(
+                                                    std::time::Duration::from_millis(200),
+                                                ) {
+                                                    Ok(true) => {}
+                                                    Ok(false) => continue,
+                                                    Err(_) => break,
+                                                }
+                                                match event::read() {
+                                                    Ok(Event::Key(ke)) => {
+                                                        if ke.kind != KeyEventKind::Press {
+                                                            continue;
+                                                        }
+                                                        let ictrl = ke
+                                                            .modifiers
+                                                            .contains(KeyModifiers::CONTROL);
+                                                        match ke.code {
+                                                            // Enter: confirma a nota.
+                                                            KeyCode::Enter => break,
+                                                            // Esc: cancela a nota.
+                                                            KeyCode::Esc => {
+                                                                buf.clear();
+                                                                break;
+                                                            }
+                                                            // Ctrl+C durante a nota: encerra a gravação.
+                                                            KeyCode::Char('c') if ictrl => {
+                                                                abort_stop = true;
+                                                                break;
+                                                            }
+                                                            KeyCode::Backspace => {
+                                                                if buf.pop().is_some() {
+                                                                    print!("\u{8} \u{8}");
+                                                                    let _ = std::io::stdout().flush();
+                                                                }
+                                                            }
+                                                            KeyCode::Char(c) if !ictrl => {
+                                                                buf.push(c);
+                                                                print!("{}", c);
+                                                                let _ = std::io::stdout().flush();
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                            let trimmed = buf.trim();
+                                            if !trimmed.is_empty() {
+                                                if let Ok(mut n) = notes_kb.lock() {
+                                                    if !n.is_empty() {
+                                                        n.push('\n');
+                                                    }
+                                                    n.push_str(trimmed);
+                                                }
+                                                print!("\r\x1b[Knote saved\r\n");
+                                            } else {
+                                                print!("\r\x1b[K");
+                                            }
+                                            let _ = std::io::stdout().flush();
+                                            entering_note_kb.store(false, Ordering::SeqCst);
+                                            if abort_stop {
+                                                let _ = key_tx.send(KeyCmd::Stop);
+                                                break;
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -787,6 +884,28 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .get("meeting_id")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
+
+    // Flush details/observations (--notes seed + live 'n' notes) into the meeting's
+    // AI summary context — the same field editable in the app. Done before --summarize
+    // so the notes feed the summary. A failure here is a warning only (the meeting is
+    // already persisted).
+    let notes_text = notes
+        .lock()
+        .map(|n| n.trim().to_string())
+        .unwrap_or_default();
+    if !notes_text.is_empty() && meeting_id != "?" {
+        match crate::summary::context::commands::api_save_summary_context(
+            app.state::<AppState>(),
+            meeting_id.to_string(),
+            notes_text,
+        )
+        .await
+        {
+            Ok(()) => println!("✓ Notes saved to the meeting context."),
+            Err(e) => eprintln!("Warning: could not save notes: {}", e),
+        }
+    }
+
     let folder_display = folder_path.unwrap_or_else(|| "(no folder)".to_string());
     if args.record_only {
         println!(
