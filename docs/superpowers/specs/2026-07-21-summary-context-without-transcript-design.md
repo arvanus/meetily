@@ -106,9 +106,11 @@ superfície de props de um componente já grande, sem ganho.
 ### 5.3 Hook de geração
 
 `useSummaryGeneration` recebe um objeto de props (`useSummaryGeneration.ts:25`);
-ganha mais uma: `hasContextContent: boolean`, computada em `page-content.tsx`
-como `contextPrompt.trim() !== '' || attachments.length > 0`. O hook já recebe
-`transcripts`, então deriva o predicado completo internamente. Com isso:
+ganha mais uma: `canGenerate: boolean` — o **mesmo** valor de §5.2, computado
+uma vez em `page-content.tsx` e distribuído para o hook e para `SummaryPanel`.
+Um único booleano em vez de um `hasContextContent` separado: o hook precisa
+exatamente da pergunta "existe alguma fonte de conteúdo?", e duplicar a regra
+nos dois lugares abriria espaço para divergirem. Com isso:
 
 - **linha 411:** com zero transcrições, seguir adiante com `transcriptText = ''`
   se houver contexto ou anexo. Só aborta (toast + `return`) se as três fontes
@@ -116,8 +118,10 @@ como `contextPrompt.trim() !== '' || attachments.length > 0`. O hook já recebe
 - **linha 72:** o `throw` em `!transcriptText.trim()` deixa de ser incondicional
   pela mesma razão. A validação real de "há conteúdo" fica no ponto acima e no
   guard do Rust.
-- `setOriginalTranscript('')` no caminho sem transcrição é aceitável — só
-  alimenta a comparação de regeneração.
+- `setOriginalTranscript('')` no caminho sem transcrição é aceitável, mas
+  obriga a afrouxar também **a linha 579** (`handleRegenerateSummary`), que hoje
+  retorna sem fazer nada quando `originalTranscript` está vazio. Sem isso, um
+  resumo gerado só a partir do contexto nunca poderia ser regerado.
 
 ### 5.4 Prompt (Rust)
 
@@ -200,11 +204,15 @@ para o slot `text` quando não há transcrição, ganhando o map-reduce.
 
 ### Frontend
 
-- `canGenerateSummary`: falso com tudo vazio; verdadeiro com só contexto; com
-  só anexo; com só transcrição.
-- `SummaryGeneratorButtonGroup`: renderiza `null` com `canGenerateSummary={false}`.
-- `TranscriptPanel`: renderiza textarea com `transcripts=[]` e
-  `isRecording={false}`; não renderiza com `isRecording={true}`.
+O projeto **não tem runner de testes** — nenhum arquivo `.test.tsx`/`.spec.ts`
+versionado, nenhum config de vitest/jest, e `package.json` sem script `test`.
+Decisão: não introduzir essa infra nesta feature. A validação de frontend é
+`npx tsc --noEmit` mais a checklist manual abaixo.
+
+A regra de negócio fica em um módulo puro (`lib/summary-generation.ts`),
+espelhando `has_summarizable_content` do Rust — que **é** coberto por
+`cargo test`. Adicionar vitest e testar `canGenerateSummary` diretamente
+continua sendo um bom próximo passo, fora deste escopo.
 
 ### Manual
 
