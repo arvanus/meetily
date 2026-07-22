@@ -13,6 +13,13 @@ name: "Build Windows (CUDA)"
 # CMAKE_BUILD_PARALLEL_LEVEL e CARGO_BUILD_JOBS. Build frio ~40-50 min.
 
 on:
+  # Gatilho push TEMPORARIO (restrito a este branch e ao proprio arquivo) para
+  # permitir rodar o build sem registrar o workflow no branch default. Remover
+  # apos o build validar.
+  push:
+    branches: [test/all-features]
+    paths:
+      - '.github/workflows/build-cuda-windows.yml'
   workflow_dispatch:
     inputs:
       build-type:
@@ -129,7 +136,7 @@ jobs:
         id: cuda-toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: ${{ github.event.inputs.cuda-version }}
+          cuda: ${{ github.event.inputs.cuda-version || '12.6.2' }}
           method: 'network'
           # Componentes minimos para compilar. IMPORTANTE: cublas_dev traz os
           # headers (cublas_v2.h) e as import libs (cublas.lib/cublasLt.lib) —
@@ -282,7 +289,7 @@ jobs:
           Write-Host "Todas as DLLs CUDA foram empacotadas no instalador."
 
       - name: Upload artifacts
-        if: ${{ github.event.inputs.upload-artifacts == 'true' }}
+        if: ${{ github.event.inputs.upload-artifacts != 'false' }}
         uses: actions/upload-artifact@v4
         with:
           name: meetily-windows-cuda-x64-${{ steps.build-profile.outputs.profile }}-${{ steps.get-version.outputs.version }}
@@ -302,6 +309,6 @@ jobs:
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Version** | ${{ steps.get-version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Profile** | ${{ steps.build-profile.outputs.profile }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Acceleration** | NVIDIA CUDA ${{ github.event.inputs.cuda-version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Acceleration** | NVIDIA CUDA ${{ github.event.inputs.cuda-version || '12.6.2' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Signed (Authenticode)** | ❌ No |" >> $GITHUB_STEP_SUMMARY
           echo "| **CUDA DLLs bundled** | cudart64_12, cublas64_12, cublasLt64_12 |" >> $GITHUB_STEP_SUMMARY
