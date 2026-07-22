@@ -1,0 +1,11 @@
+{
+    "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+    "bundle": {
+        "resources": {
+            "templates/*.json": "templates/",
+            "cuda-runtime/cudart64_12.dll": "./",
+            "cuda-runtime/cublas64_12.dll": "./",
+            "cuda-runtime/cublasLt64_12.dll": "./"
+        }
+    }
+}

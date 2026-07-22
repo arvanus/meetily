@@ -341,16 +341,18 @@ jobs:
         run: |
           echo "Building llama-helper sidecar..."
 
-          # Determine llama-helper features based on platform
+          # Determine llama-helper features based on platform.
+          # IMPORTANTE: no Windows o llama-helper e CPU-only. O backend Vulkan do
+          # llama-cpp-sys-2 exige SPIRV-Headers (nao fornecido pelo Vulkan SDK
+          # instalado) e quebra o CMake. Quem usa Vulkan e o whisper (compilado
+          # depois pelo Tauri); o llama-helper (LLM local) roda bem em CPU.
+          # Mesmo criterio dos workflows build-windows.yml / build.yml.
           LLAMA_FEATURES=""
           if [[ "${{ matrix.platform }}" == *"macos"* ]]; then
             LLAMA_FEATURES="--features metal"
             echo "Using Metal GPU acceleration for macOS"
-          elif [[ "${{ matrix.platform }}" == *"windows"* ]]; then
-            LLAMA_FEATURES="--features vulkan"
-            echo "Using Vulkan GPU acceleration for Windows"
           else
-            echo "Using CPU-only mode for Linux"
+            echo "Using CPU-only mode for llama-helper (Windows/Linux)"
           fi
 
           # Build llama-helper from workspace root

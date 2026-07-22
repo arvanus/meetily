@@ -1,0 +1,307 @@
+name: "Build Windows (CUDA)"
+
+# Build dedicado do Meetily para Windows com aceleracao NVIDIA CUDA.
+# Diferente dos demais workflows (que usam Vulkan), este:
+#   - instala o CUDA Toolkit no runner;
+#   - compila whisper-rs com --features cuda;
+#   - empacota as DLLs de runtime do CUDA (cudart/cublas/cublasLt) dentro do
+#     instalador, via override de config (tauri.windows-cuda.conf.json), para
+#     rodar em qualquer PC com GPU NVIDIA sem exigir o CUDA Toolkit instalado.
+#
+# NOTA: build de CUDA e pesado. Os templates do whisper.cpp estouram a RAM do
+# runner (16GB) com paralelismo alto (erro C1060), por isso limitamos
+# CMAKE_BUILD_PARALLEL_LEVEL e CARGO_BUILD_JOBS. Build frio ~40-50 min.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-type:
+        description: 'Build type'
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+      cuda-version:
+        description: 'CUDA Toolkit version'
+        required: true
+        type: string
+        default: '12.6.2'
+      upload-artifacts:
+        description: 'Upload build artifacts'
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  # Limita o paralelismo para evitar "C1060: compiler out of heap space" nos
+  # templates CUDA do whisper.cpp (mmq.cuh) em runner de 16GB.
+  # Quem efetivamente limita a compilacao do whisper.cpp e o CARGO_BUILD_JOBS:
+  # o crate `cmake` usa NUM_JOBS (= CARGO_BUILD_JOBS) em `cmake --parallel`, que
+  # tem precedencia sobre CMAKE_BUILD_PARALLEL_LEVEL. Mantemos os dois por seguranca.
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+  CARGO_BUILD_JOBS: 2
+  # Permite nvcc compilar mesmo se o MSVC do runner for mais novo que o
+  # oficialmente suportado pela versao do CUDA (CMake inicializa
+  # CMAKE_CUDA_FLAGS a partir de CUDAFLAGS).
+  CUDAFLAGS: -allow-unsupported-compiler
+
+jobs:
+  build-cuda:
+    name: Build Windows CUDA (x64)
+    # Fixado em windows-2022 (VS 2022 / toolset v170) de proposito: o
+    # windows-latest migrou para VS 2026 (v180) + CMake 4.4, que o CUDA 12.6
+    # NAO suporta (nvcc/BuildCustomizations sao para v170). Em VS 2022 o CUDA
+    # integra corretamente.
+    runs-on: windows-2022
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tauri.conf.json
+        id: get-version
+        shell: bash
+        run: |
+          VERSION=$(grep -o '"version": "[^"]*"' frontend/src-tauri/tauri.conf.json | cut -d'"' -f4)
+          echo "Application version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Determine build profile
+        id: build-profile
+        shell: bash
+        run: |
+          if [[ "${{ github.event.inputs.build-type }}" == "debug" ]]; then
+            echo "profile=debug" >> "$GITHUB_OUTPUT"
+            echo "args=--debug" >> "$GITHUB_OUTPUT"
+          else
+            echo "profile=release" >> "$GITHUB_OUTPUT"
+            echo "args=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: windows-x64-cuda-v1
+
+      - name: Install CUDA Toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ github.event.inputs.cuda-version }}
+          method: 'network'
+          # Componentes minimos para compilar. IMPORTANTE: cublas_dev traz os
+          # headers (cublas_v2.h) e as import libs (cublas.lib/cublasLt.lib) —
+          # sem ele o CMake/link falha (o pacote `cublas` so tem as DLLs de runtime).
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+          use-github-cache: true
+          use-local-cache: true
+
+      - name: Verify CUDA installation
+        shell: pwsh
+        run: |
+          Write-Host "CUDA_PATH: $env:CUDA_PATH"
+          Write-Host "Installed CUDA: ${{ steps.cuda-toolkit.outputs.cuda }}"
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          Write-Host "`nDLLs disponiveis em CUDA_PATH\bin:"
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter "*.dll" | Where-Object { $_.Name -match "cudart|cublas" } | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Ensure CUDA integration for Visual Studio (MSBuild)
+        shell: pwsh
+        run: |
+          # O crate `cmake` usa o gerador "Visual Studio 17 2022", que exige os
+          # BuildCustomizations do CUDA (.props/.targets) instalados no VS. O
+          # sub-package visual_studio_integration nem sempre os injeta no VS
+          # correto do runner; copiamos manualmente para garantir (mesma
+          # abordagem do CI oficial do whisper.cpp).
+          $src = Join-Path $env:CUDA_PATH "extras\visual_studio_integration\MSBuildExtensions"
+          if (-not (Test-Path $src)) {
+            Write-Warning "MSBuildExtensions nao encontrado em $src - seguindo mesmo assim"
+          } else {
+            $vsRoots = @(
+              "C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+              "C:\Program Files\Microsoft Visual Studio\2022\Community",
+              "C:\Program Files\Microsoft Visual Studio\2022\Professional",
+              "C:\Program Files\Microsoft Visual Studio\2022\BuildTools"
+            )
+            $copied = $false
+            foreach ($root in $vsRoots) {
+              $dest = Join-Path $root "MSBuild\Microsoft\VC\v170\BuildCustomizations"
+              if (Test-Path $dest) {
+                Copy-Item "$src\*" -Destination $dest -Recurse -Force
+                Write-Host "Copiado CUDA BuildCustomizations -> $dest"
+                $copied = $true
+              }
+            }
+            if (-not $copied) { Write-Warning "Nenhum diretorio v170 BuildCustomizations encontrado no VS2022" }
+          }
+
+      - name: Collect CUDA runtime DLLs for bundling
+        shell: pwsh
+        run: |
+          $runtimeDir = "frontend/src-tauri/cuda-runtime"
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+
+          $binDir = Join-Path $env:CUDA_PATH "bin"
+          $needed = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+
+          foreach ($name in $needed) {
+            $src = Join-Path $binDir $name
+            if (Test-Path $src) {
+              Copy-Item $src -Destination $runtimeDir -Force
+              Write-Host "Copiado: $name"
+            } else {
+              # Fallback: procura por qualquer versao 12.x correspondente
+              $prefix = $name -replace '64_12\.dll$',''
+              $match = Get-ChildItem $binDir -Filter "$prefix*64_12.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($match) {
+                Copy-Item $match.FullName -Destination (Join-Path $runtimeDir $name) -Force
+                Write-Host "Copiado (fallback $($match.Name) -> $name)"
+              } else {
+                Write-Error "DLL de runtime CUDA nao encontrada: $name (em $binDir)"
+                exit 1
+              }
+            }
+          }
+
+          Write-Host "`nConteudo de cuda-runtime:"
+          Get-ChildItem $runtimeDir | ForEach-Object { Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB,1)) MB)" }
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          pnpm install
+
+      - name: Build llama-helper sidecar (CPU-only)
+        shell: pwsh
+        run: |
+          # llama-helper roda em CPU (a aceleracao GPU e do whisper, nao do LLM local).
+          Write-Host "Building llama-helper sidecar (CPU-only)..."
+          cargo build --release -p llama-helper
+          if ($LASTEXITCODE -ne 0) { Write-Error "Failed to build llama-helper"; exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path "frontend/src-tauri/binaries" | Out-Null
+          Copy-Item "target/release/llama-helper.exe" -Destination "frontend/src-tauri/binaries/llama-helper-x86_64-pc-windows-msvc.exe"
+          Get-ChildItem "frontend/src-tauri/binaries/"
+
+      - name: Cache FFmpeg binary
+        uses: actions/cache@v4
+        with:
+          path: frontend/src-tauri/binaries/ffmpeg-*.exe
+          key: ${{ runner.os }}-ffmpeg-${{ hashFiles('frontend/src-tauri/build.rs', 'frontend/src-tauri/build/ffmpeg.rs') }}
+
+      - name: Build Tauri app (CUDA)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Assinatura do updater (gera os .sig). Chave gerada pelo mantenedor do fork.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Config opcional de licenca/online (inofensivo se vazio).
+          MEETILY_RSA_PUBLIC_KEY: ${{ secrets.MEETILY_RSA_PUBLIC_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        with:
+          projectPath: frontend
+          # --config faz merge do override que empacota as DLLs do CUDA.
+          args: --target x86_64-pc-windows-msvc --features cuda --config src-tauri/tauri.windows-cuda.conf.json ${{ steps.build-profile.outputs.args }}
+
+      - name: Verify bundled CUDA DLLs
+        shell: pwsh
+        run: |
+          $profile = "${{ steps.build-profile.outputs.profile }}"
+          $bundle = "target/x86_64-pc-windows-msvc/$profile/bundle"
+          Write-Host "Instaladores gerados:"
+          Get-ChildItem $bundle -Recurse -Include *.exe,*.msi -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          $needed = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")
+
+          # Extrai o instalador NSIS com 7-Zip e confirma que as 3 DLLs estao dentro.
+          $nsis = Get-ChildItem "$bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $nsis) {
+            Write-Error "Instalador NSIS nao encontrado em $bundle/nsis"
+            exit 1
+          }
+          $extractDir = "nsis-extract"
+          & 7z x "$($nsis.FullName)" "-o$extractDir" -y | Out-Null
+          $missing = @()
+          foreach ($dll in $needed) {
+            $found = Get-ChildItem $extractDir -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              Write-Host "OK  dentro do instalador: $dll  ($([math]::Round($found.Length/1MB,1)) MB)"
+            } else {
+              Write-Host "FALTA no instalador: $dll"
+              $missing += $dll
+            }
+          }
+          Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+          if ($missing.Count -gt 0) {
+            Write-Error "DLLs CUDA ausentes no instalador: $($missing -join ', '). O bundle das resources falhou."
+            exit 1
+          }
+          Write-Host "Todas as DLLs CUDA foram empacotadas no instalador."
+
+      - name: Upload artifacts
+        if: ${{ github.event.inputs.upload-artifacts == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-windows-cuda-x64-${{ steps.build-profile.outputs.profile }}-${{ steps.get-version.outputs.version }}
+          path: |
+            target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi
+            target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi.sig
+            target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
+            target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe.sig
+          retention-days: 30
+
+      - name: Build summary
+        shell: bash
+        run: |
+          echo "## 🟢 Windows CUDA Build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | ${{ steps.get-version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Profile** | ${{ steps.build-profile.outputs.profile }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Acceleration** | NVIDIA CUDA ${{ github.event.inputs.cuda-version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Signed (Authenticode)** | ❌ No |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CUDA DLLs bundled** | cudart64_12, cublas64_12, cublasLt64_12 |" >> $GITHUB_STEP_SUMMARY
