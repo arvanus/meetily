@@ -1,0 +1,8 @@
+# sqlx faz checksum (SHA-384) dos BYTES CRUS de cada arquivo de migration em
+# tempo de compilacao e grava na tabela _sqlx_migrations. Se os bytes diferirem
+# entre maquinas (CRLF x LF por causa de core.autocrlf), o mesmo .sql gera
+# checksums diferentes: um banco criado numa maquina passa a crashar um binario
+# compilado em outra com
+#   "migration <versao> was previously applied but has been modified".
+# Fixar as migrations em LF garante bytes identicos em Windows/macOS/Linux.
+frontend/src-tauri/migrations/*.sql text eol=lf
