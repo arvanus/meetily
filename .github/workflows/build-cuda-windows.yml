@@ -13,6 +13,17 @@ name: "Build Windows (CUDA)"
 # CMAKE_BUILD_PARALLEL_LEVEL e CARGO_BUILD_JOBS. Build frio ~40-50 min.
 
 on:
+  # Todo push no branch de trabalho gera build CUDA. O repo e publico, entao os
+  # minutos de Actions sao gratuitos, e o `concurrency` abaixo cancela a run
+  # anterior quando chegam varios pushes seguidos. Os `paths` evitam gastar
+  # ~45 min num commit que so mexe em docs.
+  push:
+    branches: [test/all-features]
+    paths:
+      - 'frontend/**'
+      - 'llama-helper/**'
+      - 'Cargo.toml'
+      - '.github/workflows/build-cuda-windows.yml'
   workflow_dispatch:
     inputs:
       build-type:
@@ -281,6 +292,43 @@ jobs:
           }
           Write-Host "Todas as DLLs CUDA foram empacotadas no instalador."
 
+      - name: Package standalone CLI
+        shell: pwsh
+        run: |
+          $profile = "${{ steps.build-profile.outputs.profile }}"
+          $targetDir = "target/x86_64-pc-windows-msvc/$profile"
+
+          # `meetily-cli` e o segundo [[bin]] do crate e nao entra no instalador
+          # (nao esta em bundle.externalBin nem em bundle.resources). Este cargo
+          # build e no-op quando o `tauri build` ja produziu o binario; quando
+          # nao produziu, so falta linkar, porque as deps ja estao compiladas.
+          $cargoArgs = @(
+            "build",
+            "--manifest-path", "frontend/src-tauri/Cargo.toml",
+            "--target", "x86_64-pc-windows-msvc",
+            "--features", "cuda",
+            "--bin", "meetily-cli"
+          )
+          if ($profile -eq "release") { $cargoArgs += "--release" }
+          & cargo @cargoArgs
+          if ($LASTEXITCODE -ne 0) { Write-Error "Falha ao compilar meetily-cli"; exit $LASTEXITCODE }
+
+          $cli = Join-Path $targetDir "meetily-cli.exe"
+          if (-not (Test-Path $cli)) {
+            Write-Error "meetily-cli.exe nao encontrado em $targetDir"
+            exit 1
+          }
+
+          # A CLI roda solta, fora do instalador, entao as DLLs de runtime do
+          # CUDA precisam viajar ao lado do .exe.
+          $out = "cli-package"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item $cli -Destination $out -Force
+          Copy-Item "frontend/src-tauri/cuda-runtime/*.dll" -Destination $out -Force
+
+          Write-Host "Conteudo de cli-package:"
+          Get-ChildItem $out | ForEach-Object { Write-Host "  $($_.Name)  ($([math]::Round($_.Length/1MB,1)) MB)" }
+
       - name: Upload artifacts
         if: ${{ github.event.inputs.upload-artifacts != 'false' }}
         uses: actions/upload-artifact@v4
@@ -291,6 +339,7 @@ jobs:
             target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/msi/*.msi.sig
             target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
             target/x86_64-pc-windows-msvc/${{ steps.build-profile.outputs.profile }}/bundle/nsis/*.exe.sig
+            cli-package/**
           retention-days: 30
 
       - name: Build summary
