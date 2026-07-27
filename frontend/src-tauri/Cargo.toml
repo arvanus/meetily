@@ -113,7 +113,13 @@ nnnoiseless = "0.5"
 # NOTE: whisper-rs is declared in platform-specific sections below (macOS/Windows/Linux)
 # to ensure correct GPU features are enabled per platform
 futures-util = "0.3"
-silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", package = "silero" }
+# rev 1283485 (upstream main) instead of 26a6460: the older rev hardcoded
+# `with_intra_threads(4)` on the ORT session, so the intra-op pool kept 3 worker
+# threads spinning at ~98% of a core each between the 30ms VAD frames - a flat
+# ~14% of a 20-thread CPU burned during every recording, speech or silence.
+# Upstream PR #79 set it to 1, which makes ORT run inline with no pool at all.
+# Measured in isolation: 14.66% -> 0.10%.
+silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "1283485", package = "silero" }
 
 # Parakeet (ONNX-based fast transcription) dependencies
 ort = { version = "2.0.0-rc.10" }  # ONNX Runtime for Parakeet models
