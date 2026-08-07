@@ -13,9 +13,11 @@ use super::devices::get_safe_recording_devices_macos;
 use super::devices::{default_input_device, default_output_device};
 use super::recording_state::{RecordingState, AudioChunk, DeviceType as RecordingDeviceType};
 use super::pipeline::AudioPipelineManager;
-use super::stream::AudioStreamManager;
+use super::stream::{AudioStream, AudioStreamManager};
 use super::recording_saver::RecordingSaver;
-use super::device_monitor::{AudioDeviceMonitor, DeviceEvent, DeviceMonitorType};
+use super::device_monitor::{
+    AudioDeviceMonitor, DefaultDeviceChange, DefaultDeviceWatcher, DeviceEvent, DeviceMonitorType,
+};
 
 /// Stream manager type enumeration
 pub enum StreamManagerType {
@@ -30,6 +32,16 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    /// Whether each role was resolved from the system default (no pinned preference)
+    /// and should therefore follow it if it changes mid-recording
+    follow_default_mic: bool,
+    follow_default_system: bool,
+    default_watcher: Option<DefaultDeviceWatcher>,
+    default_change_receiver: Option<mpsc::UnboundedReceiver<DefaultDeviceChange>>,
+    /// Device profiles the mixer was configured with, kept to flag migrations that
+    /// cross device kinds (the mixer cannot be reconfigured while running)
+    mic_device_kind: Option<super::device_detection::InputDeviceKind>,
+    system_device_kind: Option<super::device_detection::InputDeviceKind>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -50,12 +62,80 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            follow_default_mic: false,
+            follow_default_system: false,
+            default_watcher: None,
+            default_change_receiver: None,
+            mic_device_kind: None,
+            system_device_kind: None,
         }
     }
 
     /// Get a clone of the recording state Arc for external use (e.g., audio level emission)
     pub fn recording_state(&self) -> Arc<RecordingState> {
         self.state.clone()
+    }
+
+    /// Declare which roles were resolved from the system default and should migrate
+    /// automatically when that default changes (headset plugged in, mic unplugged).
+    ///
+    /// Must be called before `start_recording`. Both flags default to false, so a
+    /// device the user pinned in preferences is never swapped underneath them.
+    pub fn set_follow_system_default(&mut self, microphone: bool, system_audio: bool) {
+        self.follow_default_mic = microphone;
+        self.follow_default_system = system_audio;
+    }
+
+    /// Take the receiver that reports system default device changes.
+    /// Only yields a receiver when at least one role follows the default.
+    pub fn take_default_change_receiver(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<DefaultDeviceChange>> {
+        self.default_change_receiver.take()
+    }
+
+    /// Install a stream opened for the new system default, replacing the running one.
+    ///
+    /// The stream is created by the caller (it awaits, and this manager lives behind a
+    /// sync mutex), so this step is purely the swap plus the metadata refresh.
+    pub fn install_migrated_stream(
+        &mut self,
+        stream: AudioStream,
+        device: Arc<AudioDevice>,
+        role: DeviceMonitorType,
+    ) {
+        // The mixer sized its adaptive buffers from the device profile at start and
+        // cannot be reconfigured mid-run, so a swap across kinds (wired <-> Bluetooth)
+        // keeps the original sizing until the next recording.
+        let previous_kind = match role {
+            DeviceMonitorType::Microphone => self.mic_device_kind,
+            DeviceMonitorType::SystemAudio => self.system_device_kind,
+        };
+        if let Some(previous_kind) = previous_kind {
+            let new_kind =
+                super::device_detection::InputDeviceKind::detect(&device.name, 512, 48000);
+            if new_kind != previous_kind {
+                warn!(
+                    "Device kind changed on migration ({:?} -> {:?}): mixer keeps the buffering of the original device",
+                    previous_kind, new_kind
+                );
+            }
+        }
+
+        match role {
+            DeviceMonitorType::Microphone => {
+                self.stream_manager.replace_microphone_stream(stream, device)
+            }
+            DeviceMonitorType::SystemAudio => {
+                self.stream_manager.replace_system_stream(stream, device)
+            }
+        }
+
+        // Device info is written once when recording starts, so it goes stale on a swap
+        self.recording_saver.set_device_info(
+            self.state.get_microphone_device().map(|d| d.name.clone()),
+            self.state.get_system_device().map(|d| d.name.clone()),
+        );
     }
 
     /// Start recording with specified devices
@@ -103,6 +183,11 @@ impl RecordingManager {
             ("No System Audio".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
+        // Remember the profiles the mixer is about to be configured with, so a later
+        // migration can report when it lands on a device of a different kind
+        self.mic_device_kind = microphone_device.as_ref().map(|_| mic_kind);
+        self.system_device_kind = system_device.as_ref().map(|_| sys_kind);
+
         // Update recording metadata with device information
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
@@ -132,6 +217,19 @@ impl RecordingManager {
         // Pipeline handles mixing and distribution to both recording and transcription
         self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
 
+        // Names of the devices actually being captured, kept before the Arcs move into
+        // the monitor, so the default watcher knows what it is comparing against
+        let watched_mic_name = if self.follow_default_mic {
+            microphone_device.as_ref().map(|d| d.name.clone())
+        } else {
+            None
+        };
+        let watched_system_name = if self.follow_default_system {
+            system_device.as_ref().map(|d| d.name.clone())
+        } else {
+            None
+        };
+
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {
             if let Err(e) = monitor.start_monitoring(microphone_device, system_device) {
@@ -140,6 +238,15 @@ impl RecordingManager {
             } else {
                 info!("✅ Device monitoring started");
             }
+        }
+
+        // Follow the system default for whichever roles were not pinned by the user
+        if watched_mic_name.is_some() || watched_system_name.is_some() {
+            let (watcher, receiver) =
+                DefaultDeviceWatcher::start(watched_mic_name, watched_system_name);
+            self.default_watcher = Some(watcher);
+            self.default_change_receiver = Some(receiver);
+            info!("✅ Default device watcher started");
         }
 
         info!("Recording manager started successfully with {} active streams",
@@ -192,6 +299,11 @@ impl RecordingManager {
                 return Err(anyhow::anyhow!("❌ No microphone device available for recording"));
             }
 
+            // Do NOT follow the system default here: the selection above deliberately
+            // overrides a Bluetooth default with the built-in device, and migrating on
+            // default changes would swap right back to the device the override avoids.
+            self.set_follow_system_default(false, false);
+
             // Start recording with selected devices and auto_save setting
             self.start_recording(microphone_device, system_device, auto_save, RecordingMode::Mono).await
         }
@@ -228,8 +340,23 @@ impl RecordingManager {
                 return Err(anyhow::anyhow!("No microphone device available"));
             }
 
+            // Both roles came straight from the system default, so follow it if it changes
+            self.set_follow_system_default(
+                microphone_device.is_some(),
+                system_device.is_some(),
+            );
+
             self.start_recording(microphone_device, system_device, auto_save, RecordingMode::Mono).await
         }
+    }
+
+    /// Stop the default device watcher and drop any pending change
+    async fn stop_default_watcher(&mut self) {
+        if let Some(ref mut watcher) = self.default_watcher {
+            watcher.stop().await;
+        }
+        self.default_watcher = None;
+        self.default_change_receiver = None;
     }
 
     /// Stop recording streams without saving (for use when waiting for transcription)
@@ -240,6 +367,7 @@ impl RecordingManager {
         if let Some(ref mut monitor) = self.device_monitor {
             monitor.stop_monitoring().await;
         }
+        self.stop_default_watcher().await;
 
         // Stop recording state first
         self.state.stop_recording();
@@ -268,6 +396,7 @@ impl RecordingManager {
             info!("Stopping device monitor first...");
             monitor.stop_monitoring().await;
         }
+        self.stop_default_watcher().await;
 
         // Stop recording state first - this clears device references
         self.state.stop_recording();

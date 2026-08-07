@@ -426,6 +426,44 @@ impl AudioStreamManager {
         Ok(())
     }
 
+    /// Replace the running microphone stream with one bound to another device.
+    ///
+    /// `stream` is already capturing when it gets here, so it is installed first and
+    /// the previous stream is stopped afterwards: the pipeline never sees a window
+    /// with no microphone source. The two streams overlap for a few milliseconds,
+    /// which is far cheaper than dropping audio while the new device opens.
+    pub fn replace_microphone_stream(&mut self, stream: AudioStream, device: Arc<AudioDevice>) {
+        let previous = self.microphone_stream.replace(stream);
+        self.state.set_microphone_device(device.clone());
+
+        if let Some(old_stream) = previous {
+            let old_name = old_stream.device().name.clone();
+            if let Err(e) = old_stream.stop() {
+                warn!("Failed to stop previous microphone stream '{}': {}", old_name, e);
+            }
+            info!("🎤 Microphone stream migrated: '{}' -> '{}'", old_name, device.name);
+        } else {
+            info!("🎤 Microphone stream started on '{}' during migration", device.name);
+        }
+    }
+
+    /// Replace the running system audio stream with one bound to another device.
+    /// Same ordering guarantee as [`Self::replace_microphone_stream`].
+    pub fn replace_system_stream(&mut self, stream: AudioStream, device: Arc<AudioDevice>) {
+        let previous = self.system_stream.replace(stream);
+        self.state.set_system_device(device.clone());
+
+        if let Some(old_stream) = previous {
+            let old_name = old_stream.device().name.clone();
+            if let Err(e) = old_stream.stop() {
+                warn!("Failed to stop previous system audio stream '{}': {}", old_name, e);
+            }
+            info!("🔊 System audio stream migrated: '{}' -> '{}'", old_name, device.name);
+        } else {
+            info!("🔊 System audio stream started on '{}' during migration", device.name);
+        }
+    }
+
     /// Stop all audio streams
     pub fn stop_streams(&mut self) -> Result<()> {
         info!("Stopping all audio streams");

@@ -477,12 +477,16 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         crate::audio::recording_commands::start_recording_only(
             app.clone(),
             Some(effective_name.clone()),
+            args.mic.clone(),
+            args.system.clone(),
         )
         .await
     } else {
         crate::audio::recording_commands::start_recording_with_meeting_name(
             app.clone(),
             Some(effective_name.clone()),
+            args.mic.clone(),
+            args.system.clone(),
         )
         .await
     };
@@ -506,8 +510,8 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .ok()
         .flatten();
 
-    // (7b) Banner de início. Rótulos informativos (não fazemos resolução pesada de
-    // dispositivo): mic/system vêm de --mic/--system se informados, senão "padrão (SO)".
+    // (7b) Banner de início. --mic/--system são os dispositivos realmente usados
+    // (passados para a resolução acima); sem eles, vale a preferência ou o padrão do SO.
     let mic_label = args.mic.clone().unwrap_or_else(|| "default (OS)".to_string());
     let sys_label = args.system.clone().unwrap_or_else(|| "default (OS)".to_string());
     let lang_label = args

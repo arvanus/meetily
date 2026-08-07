@@ -99,7 +99,9 @@ pub use hardware_detector::{HardwareProfile, AdaptiveWhisperConfig, PerformanceT
 pub use encode::{
     encode_single_audio, AudioInput
 };
-pub use device_monitor::{AudioDeviceMonitor, DeviceEvent, DeviceMonitorType};
+pub use device_monitor::{
+    AudioDeviceMonitor, DefaultDeviceChange, DefaultDeviceWatcher, DeviceEvent, DeviceMonitorType,
+};
 
 // Export device detection and diagnostics
 pub use device_detection::{InputDeviceKind, calculate_buffer_timeout};

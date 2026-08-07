@@ -17,10 +17,15 @@ use super::{
     parse_audio_device,
     default_input_device,   // Get default microphone
     default_output_device,  // Get default system audio
+    AudioDevice,
+    DefaultDeviceChange,
     RecordingManager,
     DeviceEvent,
     DeviceMonitorType
 };
+use super::devices::DeviceType;
+use super::recording_state::DeviceType as StreamDeviceType;
+use super::stream::AudioStream;
 
 // Import transcription modules
 use super::transcription::{
@@ -47,6 +52,10 @@ static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
 // Audio level emission task handle for cleanup on stop
 static AUDIO_LEVEL_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+// Task that migrates capture to the new system default device, for the roles that
+// were not pinned to a specific device in preferences. Cleaned up on stop.
+static DEFAULT_DEVICE_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 // ============================================================================
 // PUBLIC TYPES
@@ -121,19 +130,291 @@ async fn resolve_transcription_info<R: Runtime>(app: &AppHandle<R>) -> (String, 
 // RECORDING COMMANDS
 // ============================================================================
 
-/// Start recording with default devices
-pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    start_recording_with_meeting_name(app, None).await
+// ============================================================================
+// AUTOMATIC DEFAULT DEVICE MIGRATION
+// ============================================================================
+
+/// Minimum time between two migration attempts of the same role
+const DEVICE_SWAP_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on migration attempts of the same role inside a rolling minute
+const MAX_DEVICE_SWAPS_PER_MINUTE: usize = 4;
+
+/// Open the new default device and hand the stream to the running recording.
+///
+/// The recording manager lives behind a sync mutex and opening a device awaits, so
+/// this reads what it needs, releases the lock, opens the device, and only then locks
+/// again to install the stream. On failure the current stream keeps running.
+async fn migrate_to_default_device(change: &DefaultDeviceChange) -> Result<(), String> {
+    // The guard is dropped explicitly: holding it across the await below would make
+    // this future non-Send and it would not compile inside the spawned task.
+    let state = {
+        let guard = RECORDING_MANAGER.lock().unwrap();
+        let state = guard.as_ref().map(|manager| manager.recording_state());
+        drop(guard);
+        state
+    }
+    .ok_or_else(|| "recording manager is no longer active".to_string())?;
+
+    let (device, stream_role) = match change.device_type {
+        DeviceMonitorType::Microphone => (
+            AudioDevice::new(change.new_name.clone(), DeviceType::Input),
+            StreamDeviceType::Microphone,
+        ),
+        DeviceMonitorType::SystemAudio => (
+            AudioDevice::new(change.new_name.clone(), DeviceType::Output),
+            StreamDeviceType::System,
+        ),
+    };
+    let device = Arc::new(device);
+
+    let stream = AudioStream::create(device.clone(), state, stream_role, None)
+        .await
+        .map_err(|e| format!("could not open '{}': {}", device.name, e))?;
+
+    let mut guard = RECORDING_MANAGER.lock().unwrap();
+    let manager = guard
+        .as_mut()
+        .ok_or_else(|| "recording stopped while the new device was opening".to_string())?;
+    manager.install_migrated_stream(stream, device, change.device_type.clone());
+
+    Ok(())
 }
 
-/// Start recording with default devices and optional meeting name
+/// Watch for system default device changes and move capture over to the new device.
+///
+/// Only reached for roles that were resolved from the system default: a device the
+/// user pinned in preferences is never swapped underneath them.
+fn spawn_default_device_migration<R: Runtime>(
+    app: AppHandle<R>,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<DefaultDeviceChange>,
+) {
+    let handle = tokio::spawn(async move {
+        // Each migration costs a short gap in that source, and Bluetooth devices
+        // flap while connecting, so migrations are rate limited per role.
+        let mut recent_swaps: std::collections::VecDeque<(DeviceMonitorType, std::time::Instant)> =
+            std::collections::VecDeque::new();
+
+        while let Some(change) = receiver.recv().await {
+            if !IS_RECORDING.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let now = std::time::Instant::now();
+            recent_swaps.retain(|(_, at)| now.duration_since(*at) < std::time::Duration::from_secs(60));
+
+            let last_swap = recent_swaps
+                .iter()
+                .filter(|(role, _)| *role == change.device_type)
+                .map(|(_, at)| *at)
+                .max();
+
+            if let Some(last) = last_swap {
+                if now.duration_since(last) < DEVICE_SWAP_COOLDOWN {
+                    warn!(
+                        "Skipping {:?} migration to '{}': previous migration was {:?} ago",
+                        change.device_type,
+                        change.new_name,
+                        now.duration_since(last)
+                    );
+                    continue;
+                }
+            }
+
+            let swaps_this_minute = recent_swaps
+                .iter()
+                .filter(|(role, _)| *role == change.device_type)
+                .count();
+            if swaps_this_minute >= MAX_DEVICE_SWAPS_PER_MINUTE {
+                warn!(
+                    "Skipping {:?} migration to '{}': device is flapping ({} migrations in the last minute)",
+                    change.device_type, change.new_name, swaps_this_minute
+                );
+                continue;
+            }
+
+            let role = match change.device_type {
+                DeviceMonitorType::Microphone => "microphone",
+                DeviceMonitorType::SystemAudio => "system",
+            };
+
+            // Counted before the attempt, not after: a device that consistently fails
+            // to open (permissions, exclusive mode) must be rate limited too, or every
+            // debounce window would fire another open attempt for the whole recording.
+            recent_swaps.push_back((change.device_type.clone(), now));
+
+            match migrate_to_default_device(&change).await {
+                Ok(()) => {
+                    info!(
+                        "✅ Migrated {} capture to the new system default '{}'",
+                        role, change.new_name
+                    );
+
+                    let _ = app.emit(
+                        "audio-device-migrated",
+                        serde_json::json!({
+                            "role": role,
+                            "from": change.old_name,
+                            "to": change.new_name,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ Could not migrate {} capture to '{}': {} - staying on '{}'",
+                        role, change.new_name, e, change.old_name
+                    );
+                }
+            }
+        }
+
+        info!("Default device migration task ended");
+    });
+
+    // Abort any task left over from an earlier recording: an orphan still holds its
+    // receiver and would swap streams on a manager it was not started for.
+    let mut global_task = DEFAULT_DEVICE_TASK.lock().unwrap();
+    if let Some(previous) = global_task.replace(handle) {
+        previous.abort();
+    }
+}
+
+/// Build a device from a name given explicitly by a caller.
+///
+/// Accepts both forms in circulation: the decorated "Name (input)" the UI stores and
+/// sends, and the plain name printed by `--list-devices`. The role being resolved
+/// wins over whatever suffix the name carries.
+fn device_from_explicit_name(name: String, device_type: DeviceType) -> AudioDevice {
+    match parse_audio_device(&name) {
+        Ok(parsed) => AudioDevice::new(parsed.name, device_type),
+        Err(_) => AudioDevice::new(name, device_type),
+    }
+}
+
+/// Resolve the microphone: explicit device → stored preference → system default.
+///
+/// A microphone is mandatory, so an unresolvable one is an error.
+fn resolve_microphone_device(
+    mic_override: Option<String>,
+    preferred_mic_name: Option<String>,
+) -> Result<Arc<AudioDevice>, String> {
+    if let Some(name) = mic_override {
+        let device = device_from_explicit_name(name, DeviceType::Input);
+        info!("🎤 Using the microphone requested explicitly: '{}'", device.name);
+        return Ok(Arc::new(device));
+    }
+
+    let Some(pref_name) = preferred_mic_name else {
+        info!("🎤 No microphone preference set, using system default");
+        return match default_input_device() {
+            Ok(device) => {
+                info!("✅ Using default microphone: '{}'", device.name);
+                Ok(Arc::new(device))
+            }
+            Err(e) => {
+                error!("❌ No default microphone available");
+                Err(format!("No microphone device available: {}", e))
+            }
+        };
+    };
+
+    info!("🎤 Attempting to use preferred microphone: '{}'", pref_name);
+    match parse_audio_device(&pref_name) {
+        Ok(device) => {
+            info!("✅ Using preferred microphone: '{}'", device.name);
+            Ok(Arc::new(device))
+        }
+        Err(e) => {
+            warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
+            warn!("   Falling back to system default microphone...");
+            match default_input_device() {
+                Ok(device) => {
+                    info!("✅ Using default microphone: '{}'", device.name);
+                    Ok(Arc::new(device))
+                }
+                Err(default_err) => {
+                    error!("❌ No microphone available (preferred and default both failed)");
+                    Err(format!(
+                        "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
+                        pref_name, default_err
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Resolve system audio: explicit device → stored preference → system default.
+///
+/// System audio is optional: `None` means the recording continues microphone-only.
+fn resolve_system_device(
+    system_override: Option<String>,
+    preferred_system_name: Option<String>,
+) -> Option<Arc<AudioDevice>> {
+    if let Some(name) = system_override {
+        let device = device_from_explicit_name(name, DeviceType::Output);
+        info!("🔊 Using the system audio device requested explicitly: '{}'", device.name);
+        return Some(Arc::new(device));
+    }
+
+    let Some(pref_name) = preferred_system_name else {
+        info!("🔊 No system audio preference set, using system default");
+        return match default_output_device() {
+            Ok(device) => {
+                info!("✅ Using default system audio: '{}'", device.name);
+                Some(Arc::new(device))
+            }
+            Err(e) => {
+                warn!("⚠️ No default system audio available: {}", e);
+                warn!("   Recording will continue with microphone only");
+                None
+            }
+        };
+    };
+
+    info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
+    match parse_audio_device(&pref_name) {
+        Ok(device) => {
+            info!("✅ Using preferred system audio: '{}'", device.name);
+            Some(Arc::new(device))
+        }
+        Err(e) => {
+            warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
+            warn!("   Falling back to system default...");
+            match default_output_device() {
+                Ok(device) => {
+                    info!("✅ Using default system audio: '{}'", device.name);
+                    Some(Arc::new(device))
+                }
+                Err(default_err) => {
+                    warn!("⚠️ No system audio available (preferred and default both failed): {}", default_err);
+                    warn!("   Recording will continue with microphone only");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Start recording with default devices
+pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    start_recording_with_meeting_name(app, None, None, None).await
+}
+
+/// Start recording with optional meeting name and optional device overrides.
+///
+/// `mic_override` / `system_override` take plain device names as printed by
+/// `--list-devices` and win over the stored preferences. A role given here is
+/// pinned: it does not follow the system default.
 pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
+    mic_override: Option<String>,
+    system_override: Option<String>,
 ) -> Result<(), String> {
     info!(
-        "Starting recording with default devices, meeting: {:?}",
-        meeting_name
+        "Starting recording, meeting: {:?}, mic override: {:?}, system override: {:?}",
+        meeting_name, mic_override, system_override
     );
 
     // Check if already recording
@@ -180,94 +461,16 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             }
         };
 
-    // ============================================================================
-    // MICROPHONE DEVICE RESOLUTION: Preference → Default → Error
-    // ============================================================================
-    let microphone_device = match preferred_mic_name {
-        Some(pref_name) => {
-            info!("🎤 Attempting to use preferred microphone: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
-                Ok(device) => {
-                    info!("✅ Using preferred microphone: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
-                    warn!("   Falling back to system default microphone...");
-                    match default_input_device() {
-                        Ok(device) => {
-                            info!("✅ Using default microphone: '{}'", device.name);
-                            Some(Arc::new(device))
-                        }
-                        Err(default_err) => {
-                            error!("❌ No microphone available (preferred and default both failed)");
-                            return Err(format!(
-                                "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
-                                pref_name, default_err
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            info!("🎤 No microphone preference set, using system default");
-            match default_input_device() {
-                Ok(device) => {
-                    info!("✅ Using default microphone: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    error!("❌ No default microphone available");
-                    return Err(format!("No microphone device available: {}", e));
-                }
-            }
-        }
-    };
+    // Only a role with neither an explicit device nor a preference is following the
+    // system default, and only those migrate automatically when the default changes
+    // (headset plugged in, mic unplugged). A pinned device stays pinned, including
+    // when it is missing and the resolution below falls back to the default.
+    let follow_default_mic = mic_override.is_none() && preferred_mic_name.is_none();
+    let follow_default_system = system_override.is_none() && preferred_system_name.is_none();
 
-    // ============================================================================
-    // SYSTEM AUDIO DEVICE RESOLUTION: Preference → Default → None (optional)
-    // ============================================================================
-    let system_device = match preferred_system_name {
-        Some(pref_name) => {
-            info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
-                Ok(device) => {
-                    info!("✅ Using preferred system audio: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
-                    warn!("   Falling back to system default...");
-                    match default_output_device() {
-                        Ok(device) => {
-                            info!("✅ Using default system audio: '{}'", device.name);
-                            Some(Arc::new(device))
-                        }
-                        Err(default_err) => {
-                            warn!("⚠️ No system audio available (preferred and default both failed): {}", default_err);
-                            warn!("   Recording will continue with microphone only");
-                            None // System audio is optional
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            info!("🔊 No system audio preference set, using system default");
-            match default_output_device() {
-                Ok(device) => {
-                    info!("✅ Using default system audio: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!("⚠️ No default system audio available: {}", e);
-                    warn!("   Recording will continue with microphone only");
-                    None // System audio is optional
-                }
-            }
-        }
-    };
+    // Explicit → Preference → Default (microphone is mandatory, system audio is not)
+    let microphone_device = Some(resolve_microphone_device(mic_override, preferred_mic_name)?);
+    let system_device = resolve_system_device(system_override, preferred_system_name);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -291,6 +494,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         let _ = app_for_error.emit("recording-error", error.user_message());
     });
 
+    manager.set_follow_system_default(follow_default_mic, follow_default_system);
+
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
         .start_recording(microphone_device, system_device, auto_save, recording_mode)
@@ -300,10 +505,18 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Get recording state before storing manager (for audio level emission)
     let recording_state_arc = manager.recording_state();
 
+    // Taken before the manager moves into the global; Some only when a role follows the default
+    let default_change_receiver = manager.take_default_change_receiver();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         *global_manager = Some(manager);
+    }
+
+    // Spawn only after the manager is reachable globally - the task locks it to swap streams
+    if let Some(receiver) = default_change_receiver {
+        spawn_default_device_migration(app.clone(), receiver);
     }
 
     // Set recording flag and reset speech detection flag
@@ -416,10 +629,12 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 pub async fn start_recording_only<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
+    mic_override: Option<String>,
+    system_override: Option<String>,
 ) -> Result<(), String> {
     info!(
-        "Starting RECORD-ONLY recording (no AI), meeting: {:?}",
-        meeting_name
+        "Starting RECORD-ONLY recording (no AI), meeting: {:?}, mic override: {:?}, system override: {:?}",
+        meeting_name, mic_override, system_override
     );
 
     // Check if already recording
@@ -456,96 +671,14 @@ pub async fn start_recording_only<R: Runtime>(
     // for re-transcription later in the app).
     let auto_save = true;
 
-    // ========================================================================
-    // MICROPHONE DEVICE RESOLUTION: Preference → Default → Error
-    // (identical to start_recording_with_meeting_name)
-    // ========================================================================
-    let microphone_device = match preferred_mic_name {
-        Some(pref_name) => {
-            info!("🎤 Attempting to use preferred microphone: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
-                Ok(device) => {
-                    info!("✅ Using preferred microphone: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
-                    warn!("   Falling back to system default microphone...");
-                    match default_input_device() {
-                        Ok(device) => {
-                            info!("✅ Using default microphone: '{}'", device.name);
-                            Some(Arc::new(device))
-                        }
-                        Err(default_err) => {
-                            error!("❌ No microphone available (preferred and default both failed)");
-                            return Err(format!(
-                                "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
-                                pref_name, default_err
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            info!("🎤 No microphone preference set, using system default");
-            match default_input_device() {
-                Ok(device) => {
-                    info!("✅ Using default microphone: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    error!("❌ No default microphone available");
-                    return Err(format!("No microphone device available: {}", e));
-                }
-            }
-        }
-    };
+    // Same rule as the normal path: only a role with neither an explicit device nor a
+    // preference follows the system default and migrates when that default changes.
+    let follow_default_mic = mic_override.is_none() && preferred_mic_name.is_none();
+    let follow_default_system = system_override.is_none() && preferred_system_name.is_none();
 
-    // ========================================================================
-    // SYSTEM AUDIO DEVICE RESOLUTION: Preference → Default → None (optional)
-    // (identical to start_recording_with_meeting_name)
-    // ========================================================================
-    let system_device = match preferred_system_name {
-        Some(pref_name) => {
-            info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
-                Ok(device) => {
-                    info!("✅ Using preferred system audio: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
-                    warn!("   Falling back to system default...");
-                    match default_output_device() {
-                        Ok(device) => {
-                            info!("✅ Using default system audio: '{}'", device.name);
-                            Some(Arc::new(device))
-                        }
-                        Err(default_err) => {
-                            warn!("⚠️ No system audio available (preferred and default both failed): {}", default_err);
-                            warn!("   Recording will continue with microphone only");
-                            None // System audio is optional
-                        }
-                    }
-                }
-            }
-        }
-        None => {
-            info!("🔊 No system audio preference set, using system default");
-            match default_output_device() {
-                Ok(device) => {
-                    info!("✅ Using default system audio: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(e) => {
-                    warn!("⚠️ No default system audio available: {}", e);
-                    warn!("   Recording will continue with microphone only");
-                    None // System audio is optional
-                }
-            }
-        }
-    };
+    // Same resolution as the normal path: Explicit → Preference → Default
+    let microphone_device = Some(resolve_microphone_device(mic_override, preferred_mic_name)?);
+    let system_device = resolve_system_device(system_override, preferred_system_name);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -563,6 +696,8 @@ pub async fn start_recording_only<R: Runtime>(
     manager.set_error_callback(move |error| {
         let _ = app_for_error.emit("recording-error", error.user_message());
     });
+
+    manager.set_follow_system_default(follow_default_mic, follow_default_system);
 
     // Start recording with resolved devices. auto_save is forced true above.
     let transcription_receiver = manager
@@ -584,10 +719,18 @@ pub async fn start_recording_only<R: Runtime>(
     // Get recording state before storing manager (for audio level emission)
     let recording_state_arc = manager.recording_state();
 
+    // Taken before the manager moves into the global; Some only when a role follows the default
+    let default_change_receiver = manager.take_default_change_receiver();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         *global_manager = Some(manager);
+    }
+
+    // Spawn only after the manager is reachable globally - the task locks it to swap streams
+    if let Some(receiver) = default_change_receiver {
+        spawn_default_device_migration(app.clone(), receiver);
     }
 
     // Set recording flag and reset speech detection flag
@@ -645,7 +788,9 @@ pub async fn start_recording_only<R: Runtime>(
     Ok(())
 }
 
-/// Start recording with specific devices
+/// Start recording with specific devices.
+/// A `None` name means "not specified" (the UI sends null for "Default"), not "no
+/// device": that role falls back to the stored preference and then the system default.
 pub async fn start_recording_with_devices<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
@@ -654,7 +799,8 @@ pub async fn start_recording_with_devices<R: Runtime>(
     start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
 }
 
-/// Start recording with specific devices and optional meeting name
+/// Start recording with specific devices and optional meeting name.
+/// See [`start_recording_with_devices`] for how a `None` device name is resolved.
 pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
@@ -690,40 +836,43 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Parse devices
-    let mic_device = if let Some(ref name) = mic_device_name {
-        Some(Arc::new(parse_audio_device(name).map_err(|e| {
-            format!("Invalid microphone device '{}': {}", name, e)
-        })?))
-    } else {
-        None
-    };
-
-    let system_device = if let Some(ref name) = system_device_name {
-        Some(Arc::new(parse_audio_device(name).map_err(|e| {
-            format!("Invalid system device '{}': {}", name, e)
-        })?))
-    } else {
-        None
-    };
-
     // Async-first approach for custom devices - no more blocking operations!
     info!("🚀 Starting async recording initialization with custom devices");
 
     // Create new recording manager
     let mut manager = RecordingManager::new();
 
-    // Load recording preferences to check auto_save setting
-    let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
-        Ok(prefs) => {
-            info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
-            prefs.auto_save
-        }
-        Err(e) => {
-            warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
-            true // Default to saving if preferences can't be loaded
-        }
-    };
+    // Load recording preferences for auto_save and for the roles left unspecified
+    let (auto_save, preferred_mic_name, preferred_system_name) =
+        match super::recording_preferences::load_recording_preferences(&app).await {
+            Ok(prefs) => {
+                info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
+                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
+            }
+            Err(e) => {
+                warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
+                (true, None, None) // Default to saving if preferences can't be loaded
+            }
+        };
+
+    // A role named here is pinned. A role left as None is NOT "no device": the UI sends
+    // null for "Default", so it resolves from the preference and then the system
+    // default, and only in that case does it follow the default while recording.
+    let follow_default_mic = mic_device_name.is_none() && preferred_mic_name.is_none();
+    let follow_default_system = system_device_name.is_none() && preferred_system_name.is_none();
+
+    let microphone = resolve_microphone_device(mic_device_name, preferred_mic_name)?;
+    let system_device = resolve_system_device(system_device_name, preferred_system_name);
+
+    // Labels for the "recording-started" event: what was actually resolved, which is
+    // more useful than the requested name now that None falls back
+    let started_mic_label = microphone.name.clone();
+    let started_system_label = system_device
+        .as_ref()
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "No System Audio".to_string());
+
+    let mic_device = Some(microphone);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -746,16 +895,26 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         let _ = app_for_error.emit("recording-error", error.user_message());
     });
 
+    manager.set_follow_system_default(follow_default_mic, follow_default_system);
+
     // Start recording with specified devices and auto_save setting
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save, super::recording_preferences::RecordingMode::Mono)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
+    // Taken before the manager moves into the global; Some only when a role follows the default
+    let default_change_receiver = manager.take_default_change_receiver();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         *global_manager = Some(manager);
+    }
+
+    // Spawn only after the manager is reachable globally - the task locks it to swap streams
+    if let Some(receiver) = default_change_receiver {
+        spawn_default_device_migration(app.clone(), receiver);
     }
 
     // Set recording flag and reset speech detection flag
@@ -808,10 +967,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Emit success event
     app.emit("recording-started", serde_json::json!({
         "message": "Recording started with custom devices and parallel processing",
-        "devices": [
-            mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
-            system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
-        ],
+        "devices": [started_mic_label, started_system_label],
         "workers": 3
     })).map_err(|e| e.to_string())?;
 
@@ -1205,6 +1361,14 @@ pub async fn stop_recording<R: Runtime>(
     {
         let mut level_task = AUDIO_LEVEL_TASK.lock().unwrap();
         if let Some(handle) = level_task.take() {
+            handle.abort();
+        }
+    }
+
+    // Clean up default device migration task
+    {
+        let mut migration_task = DEFAULT_DEVICE_TASK.lock().unwrap();
+        if let Some(handle) = migration_task.take() {
             handle.abort();
         }
     }

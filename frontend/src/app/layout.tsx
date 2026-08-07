@@ -20,6 +20,7 @@ import { OnboardingProvider } from '@/contexts/OnboardingContext'
 import { OnboardingFlow } from '@/components/onboarding'
 import { loadBetaFeatures } from '@/types/betaFeatures'
 import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgressToast'
+import { DeviceMigrationToastProvider } from '@/components/shared/DeviceMigrationToast'
 import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
@@ -246,6 +247,9 @@ export default function RootLayout({
                             <ImportDialogProvider onOpen={handleOpenImportDialog}>
                               {/* Download progress toast provider - listens for background downloads */}
                               <DownloadProgressToastProvider />
+
+                              {/* Tells the user when a recording follows the system default to a new device */}
+                              <DeviceMigrationToastProvider />
 
                               {/* Show onboarding or main app */}
                               {showOnboarding ? (

@@ -366,8 +366,15 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 "No devices specified, starting with defaults and meeting: {:?}",
                 meeting_name
             );
-            audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
-                .await
+            // No device overrides here: this arm is the "no devices specified" case,
+            // so both roles resolve from preferences or the system default.
+            audio::recording_commands::start_recording_with_meeting_name(
+                app.clone(),
+                meeting_name,
+                None,
+                None,
+            )
+            .await
         }
         _ => {
             log_info!(
