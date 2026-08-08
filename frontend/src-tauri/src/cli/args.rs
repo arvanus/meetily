@@ -22,6 +22,8 @@ pub enum Command {
     ListMeetings,
     /// List available summary templates (id, name, description)
     ListTemplates,
+    /// Re-transcribe an existing meeting's saved audio with another model
+    Retranscribe(RetranscribeArgs),
     /// Generate the summary of a meeting (reuses the app's summary pipeline)
     Summarize(SummarizeArgs),
 }
@@ -66,6 +68,17 @@ pub struct RecordArgs {
     /// Transcribe only, do not save the audio file (incompatible with --record-only)
     #[arg(long)]
     pub no_audio_save: bool,
+    /// After saving, re-transcribe the recorded audio with this model (usually a
+    /// bigger/better one than the live model) before summarizing. The meeting id comes
+    /// from this same run, so overlapping CLI processes never touch each other.
+    #[arg(long)]
+    pub retranscribe_model: Option<String>,
+    /// Engine used by --retranscribe-model (whisper|parakeet); default: --engine, else whisper
+    #[arg(long)]
+    pub retranscribe_engine: Option<String>,
+    /// Language code used by --retranscribe-model (e.g. "pt", "en"); default: --language
+    #[arg(long)]
+    pub retranscribe_language: Option<String>,
     /// After saving, generate the summary of the just-recorded meeting
     #[arg(long)]
     pub summarize: bool,
@@ -82,13 +95,69 @@ impl RecordArgs {
                     .to_string(),
             );
         }
-        if self.summarize && self.record_only {
+        if self.retranscribe_model.is_some() && self.no_audio_save {
             return Err(
-                "--summarize needs a transcription; it is incompatible with --record-only."
+                "--retranscribe-model reads the saved audio file; remove --no-audio-save."
+                    .to_string(),
+            );
+        }
+        if (self.retranscribe_engine.is_some() || self.retranscribe_language.is_some())
+            && self.retranscribe_model.is_none()
+        {
+            return Err(
+                "--retranscribe-engine/--retranscribe-language require --retranscribe-model."
+                    .to_string(),
+            );
+        }
+        // --summarize needs a transcript. --record-only produces none by itself, but
+        // --retranscribe-model creates one from the saved audio, so the combination
+        // record-only + retranscribe + summarize is valid (and is the cheapest path:
+        // no AI while recording, a single pass with the good model afterwards).
+        if self.summarize && self.record_only && self.retranscribe_model.is_none() {
+            return Err(
+                "--summarize needs a transcription; with --record-only, add --retranscribe-model <model>."
                     .to_string(),
             );
         }
         Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct RetranscribeArgs {
+    /// Meeting id to re-transcribe (use `list-meetings` to discover ids). Prefer this
+    /// over --last when several CLI runs can overlap.
+    #[arg(long)]
+    pub meeting: Option<String>,
+    /// Re-transcribe the most recent meeting instead of passing an id
+    #[arg(long)]
+    pub last: bool,
+    /// Model to transcribe with (see `list-models`)
+    #[arg(long)]
+    pub model: String,
+    /// Engine (whisper|parakeet); default: whisper
+    #[arg(long)]
+    pub engine: Option<String>,
+    /// Language code (e.g. "pt", "en"); default: the app preference
+    #[arg(long)]
+    pub language: Option<String>,
+    /// After re-transcribing, generate the summary of the meeting
+    #[arg(long)]
+    pub summarize: bool,
+    /// Template id used when --summarize is set (default: "daily_standup")
+    #[arg(long)]
+    pub template: Option<String>,
+}
+
+impl RetranscribeArgs {
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.meeting.is_some(), self.last) {
+            (true, true) => Err("use either --meeting <id> or --last, not both.".to_string()),
+            (false, false) => {
+                Err("specify the meeting to re-transcribe: --meeting <id> or --last.".to_string())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -196,5 +265,109 @@ mod tests {
         let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
         assert!(args.validate().is_ok());
         assert!(args.summarize);
+    }
+
+    #[test]
+    fn retranscribe_model_is_parsed() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "record",
+            "--model",
+            "base",
+            "--retranscribe-model",
+            "large-v3",
+            "--summarize",
+        ]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_ok());
+        assert_eq!(args.model.as_deref(), Some("base"));
+        assert_eq!(args.retranscribe_model.as_deref(), Some("large-v3"));
+    }
+
+    #[test]
+    fn retranscribe_with_no_audio_save_is_rejected() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "record",
+            "--retranscribe-model",
+            "large-v3",
+            "--no-audio-save",
+        ]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn retranscribe_engine_without_model_is_rejected() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--retranscribe-engine", "parakeet"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn record_only_with_retranscribe_and_summarize_is_ok() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "record",
+            "--record-only",
+            "--retranscribe-model",
+            "large-v3",
+            "--summarize",
+        ]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn record_only_summarize_without_retranscribe_is_rejected() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--record-only", "--summarize"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn retranscribe_meeting_id_with_summarize_is_ok() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "retranscribe",
+            "--meeting",
+            "abc",
+            "--model",
+            "large-v3",
+            "--summarize",
+        ]);
+        let Some(Command::Retranscribe(args)) = cli.command else {
+            panic!("expected Retranscribe")
+        };
+        assert!(args.validate().is_ok());
+        assert_eq!(args.meeting.as_deref(), Some("abc"));
+        assert_eq!(args.model, "large-v3");
+        assert!(args.summarize);
+    }
+
+    #[test]
+    fn retranscribe_requires_a_target() {
+        let cli = Cli::parse_from(["meetily-cli", "retranscribe", "--model", "large-v3"]);
+        let Some(Command::Retranscribe(args)) = cli.command else {
+            panic!("expected Retranscribe")
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn retranscribe_rejects_both_targets() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "retranscribe",
+            "--meeting",
+            "abc",
+            "--last",
+            "--model",
+            "large-v3",
+        ]);
+        let Some(Command::Retranscribe(args)) = cli.command else {
+            panic!("expected Retranscribe")
+        };
+        assert!(args.validate().is_err());
     }
 }

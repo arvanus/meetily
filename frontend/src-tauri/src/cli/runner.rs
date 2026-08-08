@@ -1,4 +1,4 @@
-use crate::cli::args::{RecordArgs, SummarizeArgs};
+use crate::cli::args::{RecordArgs, RetranscribeArgs, SummarizeArgs};
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
 use std::io::Write;
@@ -910,8 +910,10 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         }
     }
 
-    let folder_display = folder_path.unwrap_or_else(|| "(no folder)".to_string());
-    if args.record_only {
+    let folder_display = folder_path
+        .clone()
+        .unwrap_or_else(|| "(no folder)".to_string());
+    if args.record_only && args.retranscribe_model.is_none() {
         println!(
             "✓ Recorded (no AI). meeting_id={} folder={}  Re-transcribe in the app whenever you want.",
             meeting_id, folder_display
@@ -920,9 +922,46 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         println!("✓ Saved. meeting_id={} folder={}", meeting_id, folder_display);
     }
 
-    // record --summarize: encadeia o sumário da reunião recém-gravada.
-    // (validate() já garante !record_only quando summarize.) Falha aqui é apenas
-    // warn — a gravação já foi persistida, então o comando sai com sucesso.
+    // record --retranscribe-model: re-runs the transcription from the saved audio with a
+    // better model before the summary. The id used here comes from THIS run, so several
+    // CLI processes may overlap without stepping on each other, unlike `summarize --last`,
+    // which resolves to whichever meeting finished most recently.
+    //
+    // `start_retranscription` replaces the meeting's transcripts (DELETE + INSERT in one
+    // transaction), so the summary below reads only the new text, and the explicit model
+    // wins over the app config (`get_or_init_whisper` honours the requested model).
+    if let Some(retranscribe_model) = args.retranscribe_model.clone() {
+        if meeting_id == "?" {
+            return Err(
+                "--retranscribe-model needs the meeting id, which the database did not return."
+                    .to_string(),
+            );
+        }
+        let folder = folder_path.clone().ok_or_else(|| {
+            "--retranscribe-model needs the meeting folder, which was not created.".to_string()
+        })?;
+
+        retranscribe_meeting(
+            app,
+            meeting_id,
+            folder,
+            retranscribe_model,
+            // Engine: explicit flag, else the recording engine, else whisper.
+            args.retranscribe_engine
+                .clone()
+                .or_else(|| args.engine.clone()),
+            args.retranscribe_language
+                .clone()
+                .or_else(|| args.language.clone()),
+        )
+        .await?;
+    }
+
+    // record --summarize: chains the summary of the meeting just recorded. validate()
+    // guarantees there is a transcript to work with: either the live one, or the one
+    // --retranscribe-model produced above (the only way --record-only gets here).
+    // A failure here is a warning only: the recording is already persisted, so the
+    // command still exits successfully.
     if args.summarize {
         match summarize_existing_meeting(app, meeting_id, args.template.clone()).await {
             Ok(()) => println!("✓ Summary saved. meeting_id={}", meeting_id),
@@ -1049,6 +1088,204 @@ pub async fn summarize_meeting(
         Ok(None) => Err("summary process not found after generation.".to_string()),
         Err(e) => Err(format!("failed to read the summary status: {}", e)),
     }
+}
+
+/// Re-transcribes a meeting's already-saved audio with another model, REPLACING its
+/// transcripts (`start_retranscription` does DELETE + INSERT in one transaction).
+/// Shared by `record --retranscribe-model` and by the `retranscribe` subcommand.
+///
+/// `engine` takes whisper|localWhisper|parakeet; anything else falls back to whisper
+/// with a warning. `language` as `None` lets the engine use the app preference.
+///
+/// Ctrl+C cancels and exits with 130 on purpose: whatever is chained after this
+/// (the summary) must not run on top of the old transcript.
+async fn retranscribe_meeting(
+    app: &tauri::AppHandle,
+    meeting_id: &str,
+    folder: String,
+    model: String,
+    engine: Option<String>,
+    language: Option<String>,
+) -> Result<(), String> {
+    let provider = match engine.as_deref() {
+        Some("parakeet") => "parakeet",
+        Some("whisper") | Some("localWhisper") | None => "whisper",
+        Some(other) => {
+            eprintln!("Warning: unknown engine '{}'; using whisper.", other);
+            "whisper"
+        }
+    };
+
+    // The engine global must exist: `get_or_init_whisper` LOADS a model but does not
+    // CREATE the engine, it errors with "not initialized" instead. In the app, setup()
+    // does this; in the CLI it only happens lazily during live transcription, so it is
+    // still None under --record-only, and it is also None for the engine that did not
+    // record (e.g. recorded with parakeet, re-transcribing with whisper). Both inits are
+    // idempotent no-ops when the engine already exists.
+    let init = if provider == "parakeet" {
+        crate::parakeet_engine::commands::parakeet_init().await
+    } else {
+        crate::whisper_engine::commands::whisper_init().await
+    };
+    init.map_err(|e| format!("Failed to initialize the {} engine: {}", provider, e))?;
+
+    println!(
+        "⟳ Re-transcribing with {}/{} (press Ctrl+C to cancel; anything chained after it is skipped).",
+        provider, model
+    );
+
+    // Progress feed: the job emits "retranscription-progress" while decoding and
+    // transcribing. Without it a large model over a long meeting looks frozen for
+    // minutes, and the user cannot tell whether their Ctrl+C registered.
+    let progress_listener = {
+        use tauri::Listener;
+        app.listen("retranscription-progress", move |e: tauri::Event| {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(e.payload()) {
+                let msg = v["message"].as_str().unwrap_or_default();
+                let pct = v["progress_percentage"].as_u64().unwrap_or(0);
+                print!("\r\x1b[K⏳ {:>3}% {}", pct, msg);
+                let _ = std::io::stdout().flush();
+            }
+        })
+    };
+
+    // Ctrl+C here only RAISES the cancellation flag: the job checks it between chunks and
+    // unwinds on its own, unloading the engine. Racing it with `tokio::select!` would drop
+    // the future instead, leaving the blocking Whisper task and the loaded model behind.
+    // A second Ctrl+C gives up on waiting for that unwind.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_watch = {
+        let cancelled = cancelled.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancelled.store(true, Ordering::SeqCst);
+                println!();
+                println!("⚠ Cancelling the re-transcription (press Ctrl+C again to abandon)...");
+                crate::audio::retranscription::cancel_retranscription();
+            }
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!();
+                eprintln!(
+                    "⚠ Abandoned during the re-transcription; the meeting keeps the transcript \
+                     it already had."
+                );
+                std::process::exit(130);
+            }
+        })
+    };
+
+    let result = crate::audio::retranscription::start_retranscription(
+        app.clone(),
+        meeting_id.to_string(),
+        folder,
+        language,
+        Some(model.clone()),
+        Some(provider.to_string()),
+    )
+    .await;
+    cancel_watch.abort();
+    {
+        use tauri::Listener;
+        app.unlisten(progress_listener);
+    }
+    print!("\r\x1b[K");
+    let _ = std::io::stdout().flush();
+
+    match result {
+        Ok(res) => {
+            println!(
+                "✓ Re-transcribed with {}/{}: {} segments over {:.1}s. meeting_id={}",
+                provider, model, res.segments_count, res.duration_seconds, meeting_id
+            );
+            Ok(())
+        }
+        // Cancelled: the meeting and its previous transcript are intact. Exiting here is
+        // what keeps a chained --summarize from running: summarizing the old text after
+        // the user asked for a better one would silently hand back the worse result.
+        Err(_) if cancelled.load(Ordering::SeqCst) => {
+            eprintln!(
+                "⚠ Re-transcription cancelled; nothing chained after it ran. meeting_id={}",
+                meeting_id
+            );
+            std::process::exit(130);
+        }
+        // Failed: same reasoning, stop instead of falling through to the old transcript.
+        Err(e) => Err(format!(
+            "Re-transcription failed (the meeting is intact; retry with \
+             `retranscribe --meeting {}` or in the app): {}",
+            meeting_id, e
+        )),
+    }
+}
+
+/// Re-transcribes an EXISTING meeting (`--meeting <id>` or `--last`) and, with
+/// `--summarize`, chains the summary right after it.
+pub async fn run_retranscribe(
+    app: &tauri::AppHandle,
+    args: RetranscribeArgs,
+) -> Result<(), String> {
+    use crate::database::repositories::meeting::{MeetingsRepository, STATUS_COMPLETED};
+
+    args.validate()?;
+
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    let meeting_id = if let Some(id) = args.meeting.clone() {
+        id
+    } else {
+        // --last: the most recent one (get_meetings already orders by created_at DESC).
+        // Racy when CLI runs overlap, hence the hint in the help to pass --meeting <id>.
+        let meetings = MeetingsRepository::get_meetings(&pool)
+            .await
+            .map_err(|e| format!("Failed to list meetings: {}", e))?;
+        meetings
+            .first()
+            .map(|m| m.id.clone())
+            .ok_or_else(|| "No meetings found.".to_string())?
+    };
+
+    // The meeting folder holds the audio; without it there is nothing to re-transcribe.
+    let folder = match MeetingsRepository::get_meeting_metadata(&pool, &meeting_id).await {
+        Ok(Some(m)) => {
+            // Unlike get_meetings (which filters on STATUS_COMPLETED), get_meeting_metadata
+            // returns rows that are still recording. Re-transcribing one would DELETE the
+            // transcripts of a live session and read a half-written audio file. Very much
+            // reachable when a second CLI is handed the id of a recording still in flight.
+            if m.status != STATUS_COMPLETED {
+                return Err(format!(
+                    "Meeting {} is still being recorded (status: {}); wait for it to finish.",
+                    meeting_id, m.status
+                ));
+            }
+            m.folder_path.ok_or_else(|| {
+                format!(
+                    "Meeting {} has no folder on disk; there is no audio to re-transcribe.",
+                    meeting_id
+                )
+            })?
+        }
+        Ok(None) | Err(sqlx::Error::RowNotFound) => {
+            return Err(format!("Meeting {} not found.", meeting_id))
+        }
+        Err(e) => return Err(format!("Failed to load the meeting: {}", e)),
+    };
+
+    retranscribe_meeting(
+        app,
+        &meeting_id,
+        folder,
+        args.model.clone(),
+        args.engine.clone(),
+        args.language.clone(),
+    )
+    .await?;
+
+    if args.summarize {
+        summarize_existing_meeting(app, &meeting_id, args.template.clone()).await?;
+        println!("✓ Summary saved. meeting_id={}", meeting_id);
+    }
+
+    Ok(())
 }
 
 /// Resolve transcript + template + provider/model de uma reunião EXISTENTE e
