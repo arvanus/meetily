@@ -957,6 +957,39 @@ impl AudioPipeline {
         Ok(())
     }
 
+    /// Send one mixed window to the recording path, honoring the recording mode.
+    /// Mirrors STEP 4 of the main loop so the windows drained during the shutdown
+    /// flush also reach the audio file instead of only the VAD.
+    fn send_window_to_recording(
+        &mut self,
+        mic_window: &[f32],
+        sys_window: &[f32],
+        mixed: &[f32],
+        timestamp: f64,
+    ) {
+        let (recording_data, rec_channels) = match self.recording_mode {
+            RecordingMode::Stereo => {
+                self.interleave_buffer.clear();
+                interleave_stereo_into(mic_window, sys_window, &mut self.interleave_buffer);
+                (self.interleave_buffer.clone(), 2u16)
+            }
+            RecordingMode::Mono => (mixed.to_vec(), 1u16),
+        };
+
+        if let Some(ref sender) = self.recording_sender_for_mixed {
+            let recording_chunk = AudioChunk {
+                data: recording_data,
+                sample_rate: self.sample_rate,
+                channels: rec_channels,
+                timestamp,
+                chunk_id: self.chunk_id_counter,
+                device_type: DeviceType::Microphone,
+                is_partial: false,
+            };
+            let _ = sender.send(recording_chunk);
+        }
+    }
+
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
 
@@ -966,6 +999,7 @@ impl AudioPipeline {
             if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
                 let mixed = self.mixer.mix_window(&mic_window, &sys_window);
                 let _ = self.vad_processor.process_audio(&mixed);
+                self.send_window_to_recording(&mic_window, &sys_window, &mixed, 0.0);
             }
         }
         // Force one last partial window from whatever remains in the ring buffer
@@ -985,6 +1019,7 @@ impl AudioPipeline {
                 sys_padded.resize(max_len, 0.0);
                 let mixed = self.mixer.mix_window(&mic_padded, &sys_padded);
                 let _ = self.vad_processor.process_audio(&mixed);
+                self.send_window_to_recording(&mic_padded, &sys_padded, &mixed, 0.0);
             }
         }
 

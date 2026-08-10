@@ -1,6 +1,6 @@
 use ndarray::{Array, Array1, Array2, Array3, ArrayD, ArrayViewD, IxDyn};
 use once_cell::sync::Lazy;
-use ort::execution_providers::CPUExecutionProvider;
+use ort::execution_providers::{CPUExecutionProvider, CUDAExecutionProvider, ExecutionProviderDispatch};
 use ort::inputs;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -49,6 +49,10 @@ pub struct ParakeetModel {
     vocab: Vec<String>,
     blank_idx: i32,
     vocab_size: usize,
+    /// Execution provider the encoder ended up on, for the UI and the CLI banner to
+    /// report. Derived from what the session actually registered, not from the build
+    /// features - a CUDA build still runs on CPU when the runtime DLLs are missing.
+    acceleration: &'static str,
 }
 
 impl Drop for ParakeetModel {
@@ -57,11 +61,39 @@ impl Drop for ParakeetModel {
     }
 }
 
+/// Intra-op threads per Parakeet session: half the logical CPUs, capped at 4.
+///
+/// The int8 model already runs far faster than real time; the cap keeps the three
+/// sessions from claiming the whole machine while a meeting is being recorded and
+/// mixed. Falls back to 2 when the core count cannot be read.
+fn default_intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(2)
+}
+
 impl ParakeetModel {
     pub fn new<P: AsRef<Path>>(model_dir: P, quantized: bool) -> Result<Self, ParakeetError> {
-        let encoder = Self::init_session(&model_dir, "encoder-model", None, quantized)?;
-        let decoder_joint = Self::init_session(&model_dir, "decoder_joint-model", None, quantized)?;
-        let preprocessor = Self::init_session(&model_dir, "nemo128", None, false)?;
+        // GPU only for the fp32 weights. The CUDA provider implements very few QDQ ops,
+        // so an int8 graph gets partitioned and most of it falls back to CPU anyway -
+        // with the added cost of copying tensors across the device boundary at every
+        // partition edge, which lands slower than running the whole graph on CPU.
+        //
+        // The `cuda` feature is what puts the CUDA provider in the linked ONNX Runtime;
+        // whether it can actually be registered on this machine is decided per session
+        // below, since that depends on runtime DLLs the build cannot know about.
+        let use_gpu = !quantized && cfg!(feature = "cuda");
+        if !quantized && !use_gpu {
+            log::info!("Parakeet: build has no CUDA support, running fp32 model on CPU");
+        }
+
+        let (encoder, encoder_on_gpu) =
+            Self::init_session(&model_dir, "encoder-model", None, quantized, use_gpu)?;
+        let (decoder_joint, _) =
+            Self::init_session(&model_dir, "decoder_joint-model", None, quantized, use_gpu)?;
+        // The preprocessor is a 140 KB mel spectrogram graph - dispatching it to the GPU
+        // costs more in transfers than it saves.
+        let (preprocessor, _) = Self::init_session(&model_dir, "nemo128", None, false, false)?;
 
         let (vocab, blank_idx) = Self::load_vocab(&model_dir)?;
         let vocab_size = vocab.len();
@@ -79,7 +111,13 @@ impl ParakeetModel {
             vocab,
             blank_idx,
             vocab_size,
+            acceleration: if encoder_on_gpu { "CUDA" } else { "CPU" },
         })
+    }
+
+    /// Execution provider carrying the encoder: "CUDA" or "CPU".
+    pub fn acceleration(&self) -> &'static str {
+        self.acceleration
     }
 
     fn init_session<P: AsRef<Path>>(
@@ -87,9 +125,8 @@ impl ParakeetModel {
         model_name: &str,
         intra_threads: Option<usize>,
         try_quantized: bool,
-    ) -> Result<Session, ParakeetError> {
-        let providers = vec![CPUExecutionProvider::default().build()];
-
+        use_gpu: bool,
+    ) -> Result<(Session, bool), ParakeetError> {
         // Try quantized version first if requested, fallback to regular version
         let model_filename = if try_quantized {
             let quantized_name = format!("{}.int8.onnx", model_name);
@@ -111,18 +148,81 @@ impl ParakeetModel {
             regular_name
         };
 
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers(providers)?
-            .with_parallel_execution(true)?;
+        // Threading, measured on an i7-12700H (20 logical threads) during a live
+        // recording: with the defaults below left unset, the three sessions burned
+        // ~7.8 cores CONTINUOUSLY - 41 threads at 16-23% each, none saturated,
+        // which is ONNX Runtime's thread pools spinning rather than transcribing.
+        //
+        //   - allow_spinning (ON by default): after each op the pool threads busy-wait
+        //     for more work before blocking. Transcription runs in short bursts on VAD
+        //     speech segments, so those threads spent the whole meeting spinning.
+        //   - parallel execution: adds an inter-op pool per session on top of the
+        //     intra-op one. It only pays off on wide multi-branch graphs; here it just
+        //     multiplied the number of spinning threads.
+        //   - intra threads unset: ORT defaults to one thread per core, per session.
+        //
+        // Same class of bug fixed upstream in silero-rs (see the silero_rs rev pin in
+        // Cargo.toml) - this is the other ORT user in the process.
+        let threads = intra_threads.unwrap_or_else(default_intra_threads);
 
-        if let Some(threads) = intra_threads {
-            builder = builder
+        let model_path = model_dir.as_ref().join(&model_filename);
+
+        let build_session = |providers: Vec<ExecutionProviderDispatch>| -> Result<Session, ort::Error> {
+            Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_execution_providers(providers)?
+                .with_parallel_execution(false)?
                 .with_intra_threads(threads)?
-                .with_inter_threads(threads)?;
-        }
+                .with_inter_threads(1)?
+                .with_intra_op_spinning(false)?
+                .with_inter_op_spinning(false)?
+                .commit_from_file(&model_path)
+        };
 
-        let session = builder.commit_from_file(model_dir.as_ref().join(&model_filename))?;
+        // The CUDA provider is asked to report registration failures instead of falling
+        // back on its own, so the CPU-only retry below is what actually decides - and the
+        // log then names the provider the session really got. Registration fails when the
+        // CUDA 12 / cuDNN 9 runtime DLLs are missing, which is the common case on a machine
+        // that only has a display driver.
+        let (session, on_gpu) = if use_gpu {
+            let gpu_providers = vec![
+                CUDAExecutionProvider::default().with_device_id(0).build().error_on_failure(),
+                CPUExecutionProvider::default().build(),
+            ];
+            match build_session(gpu_providers) {
+                Ok(session) => {
+                    log::info!(
+                        "Parakeet session '{}': providers=CUDA,CPU, intra_threads={} (CPU nodes), sequential execution, ORT spinning disabled",
+                        model_filename,
+                        threads
+                    );
+                    (session, true)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Parakeet session '{}': CUDA provider could not be registered, falling back to CPU. \
+                         This usually means the CUDA 12 runtime or cuDNN 9 DLLs are not on the search path. Error: {}",
+                        model_filename,
+                        e
+                    );
+                    let session = build_session(vec![CPUExecutionProvider::default().build()])?;
+                    log::info!(
+                        "Parakeet session '{}': providers=CPU, intra_threads={}, sequential execution, ORT spinning disabled",
+                        model_filename,
+                        threads
+                    );
+                    (session, false)
+                }
+            }
+        } else {
+            let session = build_session(vec![CPUExecutionProvider::default().build()])?;
+            log::info!(
+                "Parakeet session '{}': providers=CPU, intra_threads={}, sequential execution, ORT spinning disabled",
+                model_filename,
+                threads
+            );
+            (session, false)
+        };
 
         for input in &session.inputs {
             log::info!(
@@ -133,7 +233,7 @@ impl ParakeetModel {
             );
         }
 
-        Ok(session)
+        Ok((session, on_gpu))
     }
 
     fn load_vocab<P: AsRef<Path>>(model_dir: P) -> Result<(Vec<String>, i32), ParakeetError> {

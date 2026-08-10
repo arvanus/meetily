@@ -932,6 +932,12 @@ pub async fn api_save_meeting_title<R: Runtime>(
     }
 }
 
+/// Persists a meeting and its transcript segments.
+///
+/// When `meeting_id` names a row that is still flagged as "recording" - the row
+/// created when that recording started - the meeting is finalized in place and
+/// keeps its id. Otherwise a brand new meeting is created, which is what import
+/// and any caller without a pending recording gets.
 #[tauri::command]
 pub async fn api_save_transcript<R: Runtime>(
     _app: AppHandle<R>,
@@ -940,6 +946,7 @@ pub async fn api_save_transcript<R: Runtime>(
     transcripts: Vec<serde_json::Value>,
     folder_path: Option<String>,
     auth_token: Option<String>,
+    meeting_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
         "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, auth_token: {}",
@@ -977,6 +984,39 @@ pub async fn api_save_transcript<R: Runtime>(
     }
 
     let pool = state.db_manager.pool();
+
+    // Finalize the row this recording created at start, when there is one. Falls
+    // through to creating a meeting if the row is gone or was already completed.
+    if let Some(ref pending_id) = meeting_id {
+        match TranscriptsRepository::finalize_recording_meeting(
+            pool,
+            pending_id,
+            &meeting_title,
+            &transcripts_to_save,
+            folder_path.clone(),
+        )
+        .await
+        {
+            Ok(true) => {
+                log_info!("Finalized in-progress meeting {}", pending_id);
+                return Ok(serde_json::json!({
+                    "status": "success",
+                    "message": "Transcript saved successfully",
+                    "meeting_id": pending_id
+                }));
+            }
+            Ok(false) => {
+                log_warn!(
+                    "Meeting {} not found; saving as a new meeting instead",
+                    pending_id
+                );
+            }
+            Err(e) => {
+                log_error!("Failed to finalize meeting {}: {}", pending_id, e);
+                return Err(format!("Failed to save transcript: {}", e));
+            }
+        }
+    }
 
     // Now, call the repository with the correctly typed data.
     match TranscriptsRepository::save_transcript(
@@ -1022,7 +1062,7 @@ pub async fn open_meeting_folder<R: Runtime>(
 
     // Get meeting with folder_path
     let meeting: Option<MeetingModel> = sqlx::query_as(
-        "SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?",
+        "SELECT id, title, created_at, updated_at, folder_path, status FROM meetings WHERE id = ?",
     )
     .bind(&meeting_id)
     .fetch_optional(pool)

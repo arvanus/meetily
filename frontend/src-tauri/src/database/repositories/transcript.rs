@@ -82,6 +82,116 @@ impl TranscriptsRepository {
         Ok(meeting_id)
     }
 
+    /// Finalizes a meeting that was created when its recording started.
+    ///
+    /// Counterpart of [`Self::save_transcript`] for the row-at-start flow: the
+    /// meeting already exists with status "recording", so this updates it in
+    /// place instead of creating a second one, attaches the transcript segments
+    /// and flips the status to "completed". Existing segments are cleared first
+    /// so re-running it (a retried save, a recovery after a partial finalize) is
+    /// idempotent rather than duplicating text.
+    ///
+    /// Returns `false` when the meeting does not exist, so callers can fall back
+    /// to creating a fresh one.
+    pub async fn finalize_recording_meeting(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        meeting_title: &str,
+        transcripts: &[TranscriptSegment],
+        folder_path: Option<String>,
+    ) -> Result<bool, SqlxError> {
+        let mut conn = pool.acquire().await?;
+        let mut transaction = conn.begin().await?;
+
+        let now = Utc::now();
+
+        // 0. Never let an empty save wipe a meeting that is already finished.
+        //    Replacing segments is right while the recording is in flight, and it
+        //    is right when recovery brings segments to attach - but a stop that
+        //    fires twice, with the transcript state already cleared, would
+        //    otherwise erase the text of the meeting just saved.
+        let current: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM meetings WHERE id = ?")
+                .bind(meeting_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+
+        let Some((status,)) = current else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+
+        if transcripts.is_empty() && status == "completed" {
+            transaction.rollback().await?;
+            info!(
+                "Ignoring empty save for meeting {}: already completed",
+                meeting_id
+            );
+            return Ok(true);
+        }
+
+        // 1. Flip the meeting to completed. COALESCE keeps the folder recorded at
+        //    start when the caller has nothing better to offer.
+        let updated = sqlx::query(
+            "UPDATE meetings
+             SET title = ?, updated_at = ?, folder_path = COALESCE(?, folder_path), status = 'completed'
+             WHERE id = ?",
+        )
+        .bind(meeting_title)
+        .bind(now)
+        .bind(&folder_path)
+        .bind(meeting_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+
+        // 2. Replace the segments wholesale.
+        sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        for segment in transcripts {
+            let transcript_id = format!("transcript-{}", Uuid::new_v4());
+            let result = sqlx::query(
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&transcript_id)
+            .bind(meeting_id)
+            .bind(&segment.text)
+            .bind(&segment.timestamp)
+            .bind(segment.audio_start_time)
+            .bind(segment.audio_end_time)
+            .bind(segment.duration)
+            .execute(&mut *transaction)
+            .await;
+
+            if let Err(e) = result {
+                error!(
+                    "Failed to save transcript segment for meeting {}: {}",
+                    meeting_id, e
+                );
+                transaction.rollback().await?;
+                return Err(e);
+            }
+        }
+
+        transaction.commit().await?;
+
+        info!(
+            "Finalized meeting {} with {} transcript segments",
+            meeting_id,
+            transcripts.len()
+        );
+
+        Ok(true)
+    }
+
     /// Searches for a query string within the transcripts.
     /// It returns a list of matching transcripts with context.
     pub async fn search_transcripts(

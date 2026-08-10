@@ -138,6 +138,38 @@ impl RecordingSaver {
         }
     }
 
+    /// Add several segments at once, writing transcripts.json a single time.
+    /// Used on shutdown to merge back the segments transcribed while the queue
+    /// was being drained (see SHUTDOWN_SEGMENTS in recording_commands).
+    pub fn add_transcript_segments(&self, new_segments: Vec<TranscriptSegment>) {
+        if new_segments.is_empty() {
+            return;
+        }
+
+        if let Ok(mut segments) = self.transcript_segments.lock() {
+            for segment in new_segments {
+                if let Some(existing) = segments
+                    .iter_mut()
+                    .find(|s| s.sequence_id == segment.sequence_id)
+                {
+                    *existing = segment;
+                } else {
+                    segments.push(segment);
+                }
+            }
+            segments.sort_by_key(|s| s.sequence_id);
+            info!("Merged shutdown segments - total segments: {}", segments.len());
+        } else {
+            error!("Failed to lock transcript segments for batch merge");
+        }
+
+        if let Some(folder) = &self.meeting_folder {
+            if let Err(e) = self.write_transcripts_json(folder) {
+                warn!("Failed to write merged transcript update: {}", e);
+            }
+        }
+    }
+
     /// Legacy method for backward compatibility - converts text to basic segment
     pub fn add_transcript_chunk(&self, text: String) {
         let segment = TranscriptSegment {
@@ -529,6 +561,58 @@ impl Default for RecordingSaver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seg(seq: u64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            id: format!("seg_{}", seq),
+            text: text.to_string(),
+            audio_start_time: seq as f64,
+            audio_end_time: seq as f64 + 1.0,
+            duration: 1.0,
+            display_time: "[00:00]".to_string(),
+            confidence: 0.9,
+            sequence_id: seq,
+        }
+    }
+
+    /// Segments transcribed while the shutdown queue drains arrive after the
+    /// recording manager was taken, so they are merged back in one batch. They
+    /// must land in sequence order and never duplicate what is already there.
+    #[test]
+    fn test_add_transcript_segments_merges_tail_in_order() {
+        let saver = RecordingSaver::new();
+        saver.add_transcript_segment(seg(0, "first"));
+        saver.add_transcript_segment(seg(1, "second"));
+
+        saver.add_transcript_segments(vec![seg(3, "tail b"), seg(2, "tail a")]);
+
+        let segments = saver.get_transcript_segments();
+        assert_eq!(segments.len(), 4);
+        assert_eq!(
+            segments.iter().map(|s| s.sequence_id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(segments[3].text, "tail b");
+    }
+
+    #[test]
+    fn test_add_transcript_segments_upserts_existing_sequence() {
+        let saver = RecordingSaver::new();
+        saver.add_transcript_segment(seg(0, "before"));
+
+        saver.add_transcript_segments(vec![seg(0, "after")]);
+
+        let segments = saver.get_transcript_segments();
+        assert_eq!(segments.len(), 1, "same sequence_id must update, not duplicate");
+        assert_eq!(segments[0].text, "after");
+    }
+
+    #[test]
+    fn test_add_transcript_segments_empty_is_noop() {
+        let saver = RecordingSaver::new();
+        saver.add_transcript_segments(Vec::new());
+        assert!(saver.get_transcript_segments().is_empty());
+    }
 
     #[test]
     fn test_old_metadata_deserializes_with_defaults() {

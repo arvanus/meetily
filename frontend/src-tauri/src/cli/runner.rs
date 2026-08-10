@@ -202,6 +202,55 @@ async fn wait_for_stop(duration: Option<u64>) {
     }
 }
 
+/// Acceleration compiled into the binary. Only used when no engine is loaded
+/// (--record-only), because it says what the build supports, not what is in use.
+fn build_acceleration() -> &'static str {
+    if cfg!(feature = "cuda") {
+        "CUDA"
+    } else if cfg!(feature = "vulkan") {
+        "Vulkan"
+    } else if cfg!(target_os = "macos") {
+        "Metal"
+    } else {
+        "CPU"
+    }
+}
+
+/// Engine/model and backend actually in use, read from the loaded engine.
+///
+/// `provider` comes from the config and only decides WHICH engine to ask - both can hold
+/// a resident model at the same time. The model name and the backend come from the engine
+/// itself, not from the config: the loader falls back to another model when the configured
+/// one is not downloaded, and the backend depends on the execution provider having
+/// registered at runtime.
+async fn resolve_engine_status(provider: Option<&str>) -> Option<(String, &'static str)> {
+    match provider {
+        Some("parakeet") => {
+            let engine = {
+                let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().cloned()
+            }?;
+            let model = engine.get_current_model().await?;
+            let accel = engine.acceleration().await.unwrap_or("CPU");
+            Some((format!("parakeet/{}", model), accel))
+        }
+        Some("whisper") => {
+            let engine = {
+                let guard = crate::whisper_engine::commands::WHISPER_ENGINE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().cloned()
+            }?;
+            let model = engine.get_current_model().await?;
+            let accel = engine.acceleration().await.unwrap_or("CPU");
+            Some((format!("whisper/{}", model), accel))
+        }
+        _ => None,
+    }
+}
+
 /// Grava uma reunião no modo NORMAL (com IA): reusa o pipeline do app (mixagem +
 /// VAD + transcrição), imprime as linhas finalizadas ao vivo no terminal e, ao
 /// parar (Ctrl+C ou --duration), persiste a reunião no banco igual ao app.
@@ -336,8 +385,8 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // Rótulo engine/model para o painel: reusa a config padrão do banco (igual à
     // Task 2). Se falhar, mostra "?". Em --record-only não há IA → "sem IA" (7c).
     // Lido APÓS o override acima, para refletir o motor/modelo que será de fato usado.
-    let engine_model = if args.record_only {
-        "no AI".to_string()
+    let (engine_model, configured_provider) = if args.record_only {
+        ("no AI".to_string(), None)
     } else {
         match crate::api::api::api_get_transcript_config(
             app.clone(),
@@ -351,9 +400,9 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
                     "localWhisper" => "whisper".to_string(),
                     other => other.to_string(),
                 };
-                format!("{}/{}", provider, c.model)
+                (format!("{}/{}", provider, c.model), Some(provider))
             }
-            _ => "?".to_string(),
+            _ => ("?".to_string(), None),
         }
     };
     // Rótulo do motor para o banner (7b): "sem IA" em record-only, senão engine_model.
@@ -503,6 +552,18 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         return Err(format!("Failed to start recording: {}", e));
     }
 
+    // Real labels, read from the engine that actually loaded. The config is not enough:
+    // the loader falls back to another model when the configured one is missing, and the
+    // backend is only known once the sessions are up (a CUDA build without the runtime
+    // DLLs still runs on CPU).
+    let (engine_label, accel) = match resolve_engine_status(configured_provider.as_deref()).await {
+        Some((label, accel)) => (label, accel),
+        None => (engine_label, build_acceleration()),
+    };
+    if let Ok(mut p) = panel.lock() {
+        p.engine_model = engine_label.clone();
+    }
+
     // Captura o caminho da pasta da reunião AGORA: stop_recording faz take() do
     // RECORDING_MANAGER e não o devolve, então depois do stop a pasta fica indisponível.
     let folder_path = crate::audio::recording_commands::get_meeting_folder_path()
@@ -519,17 +580,6 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .as_ref()
         .map(|l| format!("   ✓ Language: {}", l))
         .unwrap_or_default();
-    // Aceleração compilada no binário (cfg de feature). Com o build CUDA e
-    // use_gpu habilitado, o whisper sobe o modelo na GPU.
-    let accel = if cfg!(feature = "cuda") {
-        "CUDA"
-    } else if cfg!(feature = "vulkan") {
-        "Vulkan"
-    } else if cfg!(target_os = "macos") {
-        "Metal"
-    } else {
-        "CPU"
-    };
     println!(
         "✓ Engine: {} [{}]   ✓ Mic: {}   ✓ System: {}{}",
         engine_label, accel, mic_label, sys_label, lang_label
@@ -812,7 +862,17 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     draw_handle.abort();
     println!();
 
-    println!("Stopping and saving... (finishing queued transcription; press Ctrl+C again to abandon)");
+    // Shutdown order (each step waits for the previous one, so nothing is lost):
+    //   1. stop the capture and flush the audio still buffered in the pipeline;
+    //   2. transcribe the remaining queue, including the VAD's final buffer;
+    //   3. write audio + transcripts.json to the meeting folder;
+    //   4. persist the meeting in the database;
+    //   5. only then (with --summarize) generate the summary.
+    // Steps 1-3 happen inside stop_recording, which is why we wait for it here.
+    println!(
+        "Stopping: flushing the final audio buffer and transcribing what is left \
+         (press Ctrl+C again to abandon)."
+    );
 
     // Mostra o progresso do shutdown (o app emite "recording-shutdown-progress"
     // enquanto processa a fila de transcrição) para não parecer congelado quando
@@ -842,7 +902,8 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
             println!();
             eprintln!(
                 "⚠ Aborted while processing the transcription backlog; pending segments were lost \
-                 (audio checkpoints remain on disk)."
+                 (audio checkpoints remain on disk). The meeting stays flagged as interrupted, so \
+                 the app will offer to recover it."
             );
             restore_config!();
             std::process::exit(130);
@@ -860,19 +921,27 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         return Err(format!("Failed to stop recording: {}", e));
     }
 
+    println!("✓ Final transcription done. Audio and transcript written to the meeting folder.");
+
     // Remove os listeners da CLI e restaura a config original (override).
+    // Done AFTER stop_recording on purpose: the last segments (the VAD's final
+    // buffer and the queue drained during shutdown) are emitted while stopping,
+    // so the listener must stay alive until then.
     unlisten_all!();
     restore_config!();
 
-    // Coleta os segmentos acumulados. Em --record-only sempre é vazio (sem IA);
-    // o save mesmo assim CRIA a reunião (vide TranscriptsRepository::save_transcript)
-    // com transcripts vazios e a folder_path correta, para o app oferecer Re-transcrever.
+    // Collect the accumulated segments. Always empty under --record-only (no AI);
+    // the save still FINALIZES the meeting, with empty transcripts and the right
+    // folder_path, so the app can offer Re-transcribe.
     let segments_vec: Vec<serde_json::Value> = match segments.lock() {
         Ok(guard) => guard.clone(),
         Err(_) => Vec::new(),
     };
 
-    // Persiste no banco EXATAMENTE como o app (cria a reunião e retorna meeting_id).
+    // Persist to the database EXACTLY like the app does. The meeting row was
+    // already created when the recording STARTED (status 'recording'); passing the
+    // id finalizes THAT row instead of creating a second one. Without an id
+    // (database unavailable at start), a new meeting is created.
     let result = crate::api::api::api_save_transcript(
         app.clone(),
         app.state::<AppState>(),
@@ -880,6 +949,7 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         segments_vec,
         folder_path.clone(),
         None,
+        crate::audio::recording_commands::current_recording_meeting_id(),
     )
     .await
     .map_err(|e| format!("Failed to save the meeting to the database: {}", e))?;

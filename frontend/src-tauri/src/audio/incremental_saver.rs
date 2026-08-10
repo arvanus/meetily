@@ -395,27 +395,27 @@ pub async fn cleanup_checkpoints(meeting_folder: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a meeting folder still holds audio checkpoints to merge.
+///
+/// Missing or unreadable folders count as "no checkpoints": both mean there is
+/// nothing left to recover.
+pub fn has_checkpoints(meeting_folder: &std::path::Path) -> bool {
+    let checkpoints_dir = meeting_folder.join(".checkpoints");
+
+    let Ok(entries) = std::fs::read_dir(&checkpoints_dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        entry.path().extension().and_then(|s| s.to_str()) == Some("mp4")
+    })
+}
+
 /// Check if a meeting folder has audio checkpoint files
 /// Returns true if .checkpoints/ directory exists and contains .mp4 files
 #[tauri::command]
 pub async fn has_audio_checkpoints(meeting_folder: String) -> Result<bool, String> {
-    let folder_path = PathBuf::from(&meeting_folder);
-    let checkpoints_dir = folder_path.join(".checkpoints");
-
-    // Check if checkpoints directory exists
-    if !checkpoints_dir.exists() {
-        return Ok(false);
-    }
-
-    // Scan for .mp4 checkpoint files
-    let has_mp4_files = std::fs::read_dir(&checkpoints_dir)
-        .map_err(|e| format!("Failed to read checkpoints directory: {}", e))?
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            entry.path().extension().and_then(|s| s.to_str()) == Some("mp4")
-        });
-
-    Ok(has_mp4_files)
+    Ok(has_checkpoints(std::path::Path::new(&meeting_folder)))
 }
 
 #[cfg(test)]

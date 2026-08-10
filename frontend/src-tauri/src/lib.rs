@@ -637,6 +637,7 @@ pub fn run() {
             audio::recording_commands::is_recording_paused,
             audio::recording_commands::get_recording_state,
             audio::recording_commands::get_meeting_folder_path,
+            audio::recording_commands::get_current_recording_meeting_id,
             // Reload sync commands (retrieve transcript history and meeting name)
             audio::recording_commands::get_transcript_history,
             audio::recording_commands::get_recording_meeting_name,
@@ -650,6 +651,11 @@ pub fn run() {
             audio::incremental_saver::recover_audio_from_checkpoints,
             audio::incremental_saver::cleanup_checkpoints,
             audio::incremental_saver::has_audio_checkpoints,
+            // Interrupted-recording recovery (rows left at status 'recording')
+            audio::recovery::api_get_incomplete_meetings,
+            audio::recovery::api_get_incomplete_meeting_transcripts,
+            audio::recovery::api_recover_meeting,
+            audio::recovery::api_discard_incomplete_meeting,
             console_utils::show_console,
             console_utils::hide_console,
             console_utils::toggle_console,

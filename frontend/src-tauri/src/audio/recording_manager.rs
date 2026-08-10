@@ -580,6 +580,14 @@ impl RecordingManager {
         self.recording_saver.add_transcript_segment(segment);
     }
 
+    /// Add several transcript segments at once (single transcripts.json write)
+    pub fn add_transcript_segments(
+        &self,
+        segments: Vec<super::recording_saver::TranscriptSegment>,
+    ) {
+        self.recording_saver.add_transcript_segments(segments);
+    }
+
     /// Add a transcript chunk to be saved later (legacy method)
     pub fn add_transcript_chunk(&self, text: String) {
         self.recording_saver.add_transcript_chunk(text);

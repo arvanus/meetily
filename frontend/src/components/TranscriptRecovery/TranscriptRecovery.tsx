@@ -1,11 +1,12 @@
 /**
  * TranscriptRecovery Component
  *
- * Modal dialog for recovering interrupted meetings from IndexedDB.
+ * Modal dialog for recovering interrupted meetings.
  * Displays recoverable meetings, allows preview, and enables recovery or deletion.
+ * Stays open until every pending recording has been recovered or discarded.
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { formatDistanceToNow } from 'date-fns';
 import { AlertCircle, CheckCircle2, Clock, FileText, Trash2, XCircle } from 'lucide-react';
 import {
@@ -44,21 +45,38 @@ export function TranscriptRecovery({
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  // Whether the user has recovered or deleted anything since this dialog opened.
+  // Only then does an empty list mean "everything has been handled" rather than
+  // "the list has not loaded yet".
+  const hasActedRef = useRef(false);
 
   // Reset selection when dialog opens
   useEffect(() => {
     if (isOpen) {
       setSelectedMeetingId(null);
       setPreviewTranscripts([]);
+      hasActedRef.current = false;
     }
   }, [isOpen]);
 
-  // Auto-select first meeting if available
+  // Auto-select first meeting if available.
+  // `selectedMeetingId` is a dependency on purpose: after an item is recovered or
+  // deleted the selection is cleared, and this has to run again to land on the
+  // next pending recording.
   useEffect(() => {
     if (isOpen && recoverableMeetings.length > 0 && !selectedMeetingId) {
       handleMeetingSelect(recoverableMeetings[0].meetingId);
     }
-  }, [isOpen, recoverableMeetings]);
+  }, [isOpen, recoverableMeetings, selectedMeetingId]);
+
+  // Close only once the list has drained. With several interrupted recordings
+  // pending, recovering one leaves the others to handle, so the dialog stays open
+  // until the last one is done.
+  useEffect(() => {
+    if (isOpen && hasActedRef.current && recoverableMeetings.length === 0) {
+      onClose();
+    }
+  }, [isOpen, recoverableMeetings.length, onClose]);
 
   const handleMeetingSelect = async (meetingId: string) => {
     setSelectedMeetingId(meetingId);
@@ -79,11 +97,28 @@ export function TranscriptRecovery({
   const handleRecover = async () => {
     if (!selectedMeetingId) return;
 
+    const recoveredId = selectedMeetingId;
+    // Pick the next pending recording now, while the list still holds every item.
+    // Walk forward from the current one, falling back to whatever else is left so
+    // the last item in the list still hands over to an earlier, unhandled one.
+    const recoveredIndex = recoverableMeetings.findIndex(m => m.meetingId === recoveredId);
+    const next =
+      recoverableMeetings[recoveredIndex + 1] ??
+      recoverableMeetings.find(m => m.meetingId !== recoveredId);
+
+    // Marked before the call: the parent drops the recovered item from the list
+    // during the await, and the close-when-drained effect must already see this.
+    hasActedRef.current = true;
     setIsRecovering(true);
     try {
-      const result = await onRecover(selectedMeetingId);
+      const result = await onRecover(recoveredId);
       console.log('Recovery successful:', result);
-      onClose();
+      setPreviewTranscripts([]);
+      if (next) {
+        await handleMeetingSelect(next.meetingId);
+      } else {
+        setSelectedMeetingId(null);
+      }
     } catch (error) {
       console.error('Recovery failed:', error);
       alert('Failed to recover meeting. Please try again.');
@@ -99,6 +134,7 @@ export function TranscriptRecovery({
       return;
     }
 
+    hasActedRef.current = true;
     setIsDeleting(true);
     try {
       await onDelete(selectedMeetingId);

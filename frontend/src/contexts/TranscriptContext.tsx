@@ -101,8 +101,20 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         // Listen for recording-started event
         unlistenRecordingStarted = await recordingService.onRecordingStarted(async () => {
           try {
-            // Generate unique meeting ID
-            const meetingId = `meeting-${Date.now()}`;
+            // Reuse the id of the meeting row the backend created when this
+            // recording started, so IndexedDB and SQLite key the same session.
+            // Recovery reads SQLite; IndexedDB is the fallback for recordings
+            // that write nothing to disk (auto-save off), and matching ids are
+            // what let one fall back to the other.
+            const { invoke } = await import('@tauri-apps/api/core');
+            let backendMeetingId: string | null = null;
+            try {
+              backendMeetingId = await invoke<string | null>('get_current_recording_meeting_id');
+            } catch (error) {
+              console.warn('Could not read the backend meeting id:', error);
+            }
+
+            const meetingId = backendMeetingId || `meeting-${Date.now()}`;
             setCurrentMeetingId(meetingId);
 
             // Store in sessionStorage as fallback for markMeetingAsSaved
@@ -132,7 +144,6 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             // Fetch folder path from backend and update metadata
             // This ensures folder path is persisted even if app crashes
             try {
-              const { invoke } = await import('@tauri-apps/api/core');
               const folderPath = await invoke<string>('get_meeting_folder_path');
               if (folderPath) {
                 const metadata = await indexedDBService.getMeetingMetadata(meetingId);

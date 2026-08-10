@@ -3,8 +3,8 @@
 use std::path::{PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use tokio::sync::{Mutex, MutexGuard, RwLock};
+use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy, WhisperState};
 use serde::{Serialize, Deserialize};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
@@ -35,7 +35,20 @@ pub struct ModelInfo {
 pub struct WhisperEngine {
     models_dir: PathBuf,
     current_context: Arc<RwLock<Option<WhisperContext>>>,
+    /// Decoding state reused across transcriptions of the same model.
+    ///
+    /// whisper_init_state allocates the self/cross/pad KV caches on the backend (VRAM on
+    /// GPU builds), builds the four ggml graph schedulers and reserves an
+    /// n_vocab * n_text_ctx logits buffer (~93 MB on the multilingual models). Creating one
+    /// per VAD chunk meant paying all of that every few seconds of a meeting. Reuse is safe
+    /// because whisper.cpp clears prompt_past at the start of every call when no_context is
+    /// set, which is the default of whisper_full_default_params and is never overridden here
+    /// - so no text leaks from one chunk into the next. Cleared whenever the model changes.
+    cached_state: Arc<Mutex<Option<WhisperState>>>,
     current_model: Arc<RwLock<Option<String>>>,
+    /// Backend the loaded context was asked to use ("CUDA", "Metal", "Vulkan", "CPU"),
+    /// so callers can report it instead of guessing from the build features.
+    current_acceleration: Arc<RwLock<Option<&'static str>>>,
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     // State tracking for smart logging
     last_transcription_was_short: Arc<RwLock<bool>>,
@@ -150,7 +163,9 @@ impl WhisperEngine {
         let engine = Self {
             models_dir,
             current_context: Arc::new(RwLock::new(None)),
+            cached_state: Arc::new(Mutex::new(None)),
             current_model: Arc::new(RwLock::new(None)),
+            current_acceleration: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize state tracking
             last_transcription_was_short: Arc::new(RwLock::new(false)),
@@ -307,9 +322,26 @@ impl WhisperEngine {
                     // Suppressor dropped here, stderr restored
                 };
 
-                // Update current context and model
+                // Update current context and model. The cached state belongs to whatever
+                // context was loaded before, so it cannot outlive this swap.
+                self.invalidate_cached_state().await;
                 *self.current_context.write().await = Some(ctx);
                 *self.current_model.write().await = Some(model_name.to_string());
+
+                // Short backend tag for the UI and the CLI banner. Honors `use_gpu`: the
+                // Low performance tier forces CPU even when the machine has a usable GPU.
+                let acceleration = if adaptive_config.use_gpu {
+                    match hardware_profile.gpu_type {
+                        crate::audio::GpuType::Metal => "Metal",
+                        crate::audio::GpuType::Cuda => "CUDA",
+                        crate::audio::GpuType::Vulkan => "Vulkan",
+                        crate::audio::GpuType::OpenCL => "OpenCL",
+                        crate::audio::GpuType::None => "CPU",
+                    }
+                } else {
+                    "CPU"
+                };
+                *self.current_acceleration.write().await = Some(acceleration);
 
                 // Enhanced acceleration status reporting
                 let acceleration_status = match (&hardware_profile.gpu_type, flash_attn_enabled) {
@@ -342,7 +374,31 @@ impl WhisperEngine {
         }
     }
 
+    /// Lock the cached decoding state, creating it from `ctx` on first use.
+    ///
+    /// Holding the guard serializes transcriptions on this engine, which matches the single
+    /// transcription worker. The batch paths that fan out (audio import, parallel processor)
+    /// keep creating their own states.
+    async fn lock_state(&self, ctx: &WhisperContext) -> Result<MutexGuard<'_, Option<WhisperState>>> {
+        let mut guard = self.cached_state.lock().await;
+        if guard.is_none() {
+            *guard = Some(ctx.create_state()?);
+        }
+        Ok(guard)
+    }
+
+    /// Drop the cached state so the next transcription rebuilds it against the current model.
+    ///
+    /// Always taken without holding the context lock: a transcription in flight holds the
+    /// context read lock while it waits on the state mutex, so acquiring them in the
+    /// opposite order here would deadlock.
+    async fn invalidate_cached_state(&self) {
+        self.cached_state.lock().await.take();
+    }
+
     pub async fn unload_model(&self) -> bool  {
+        self.invalidate_cached_state().await;
+
         let mut ctx_guard = self.current_context.write().await;
         let unloaded = ctx_guard.take().is_some();
         if unloaded {
@@ -352,11 +408,19 @@ impl WhisperEngine {
         let mut model_name_guard = self.current_model.write().await;
         model_name_guard.take();
 
+        self.current_acceleration.write().await.take();
+
         unloaded
     }
 
     pub async fn get_current_model(&self) -> Option<String> {
         self.current_model.read().await.clone()
+    }
+
+    /// Backend the loaded context was asked to use ("CUDA", "Metal", "Vulkan", "OpenCL",
+    /// "CPU"), or None when no model is loaded.
+    pub async fn acceleration(&self) -> Option<&'static str> {
+        *self.current_acceleration.read().await
     }
     
     pub async fn is_model_loaded(&self) -> bool {
@@ -578,16 +642,11 @@ impl WhisperEngine {
 
         // PERFORMANCE: Suppress verbose C library logs during transcription
         // This hides whisper_full_with_state debug logs and beam search details
-        let (num_segments, state) = {
-            // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
-
-            let mut state = ctx.create_state()?;
-            state.full(params, &audio_data)?;
-            let num_segments = state.full_n_segments();
-
-            (num_segments, state)
-            // Suppressor dropped here, stderr restored
-        };
+        // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
+        let mut state_guard = self.lock_state(ctx).await?;
+        let state = state_guard.as_mut().expect("lock_state always leaves a state in place");
+        state.full(params, &audio_data)?;
+        let num_segments = state.full_n_segments();
         let mut result = String::new();
         let mut total_confidence = 0.0;
         let mut segment_count = 0;
@@ -736,7 +795,8 @@ impl WhisperEngine {
             log::info!("Starting transcription #{} of {} samples ({:.1}s duration)",
                       transcription_count, audio_data.len(), duration_seconds);
         }
-        let mut state = ctx.create_state()?;
+        let mut state_guard = self.lock_state(ctx).await?;
+        let state = state_guard.as_mut().expect("lock_state always leaves a state in place");
         state.full(params, &audio_data)?;
 
         // Extract text with improved segment handling

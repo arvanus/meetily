@@ -426,6 +426,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 
 ## Repository-Specific Conventions
 
+- **Language**: English everywhere in the repository - code, identifiers, comments, doc comments, UI strings, log messages, commit messages, PR descriptions and documentation. (Chat with the user may be in another language; what lands in the repo is English.)
 - **Logging Format**: Backend uses detailed formatting with filename:line:function
 - **Error Handling**: Rust uses `anyhow::Result`, frontend uses try-catch with user-friendly messages
 - **Naming**: Audio devices use "microphone" and "system" consistently (not "input"/"output")

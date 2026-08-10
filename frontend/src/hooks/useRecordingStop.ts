@@ -251,10 +251,21 @@ export function useRecordingStop(
         });
 
         try {
+          // Id of the meeting row created when this recording started. Passing it
+          // finalizes that row instead of leaving it behind as an interrupted
+          // recording plus a duplicate meeting.
+          let pendingMeetingId: string | null = null;
+          try {
+            pendingMeetingId = await invoke<string | null>('get_current_recording_meeting_id');
+          } catch (error) {
+            console.warn('Could not read the pending recording meeting id:', error);
+          }
+
           const responseData = await storageService.saveMeeting(
             savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
             freshTranscripts,
-            folderPath
+            folderPath,
+            pendingMeetingId
           );
 
           const meetingId = responseData.meeting_id;

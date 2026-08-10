@@ -51,7 +51,11 @@ platform-default = []
 # Manual GPU acceleration options (for power users to override defaults)
 metal = ["whisper-rs/metal"]       # macOS: Apple Metal GPU (Auto-enabled on macOS)
 coreml = ["whisper-rs/coreml"]     # macOS: Apple CoreML acceleration
-cuda = ["whisper-rs/cuda"]         # Windows/Linux: NVIDIA CUDA GPU
+# Windows/Linux: NVIDIA CUDA GPU, for both engines.
+# `ort/cuda` makes ort-sys fetch the CUDA-enabled ONNX Runtime binaries, which need
+# CUDA 12 + cuDNN 9 on the target machine. Registration fails silently and falls back
+# to CPU when they are missing, so a CUDA build still runs on a machine without them.
+cuda = ["whisper-rs/cuda", "ort/cuda"]
 vulkan = ["whisper-rs/vulkan"]     # Windows/Linux: AMD/Intel Vulkan GPU
 hipblas = ["whisper-rs/hipblas"]   # Linux: AMD ROCm HIP
 

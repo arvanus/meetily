@@ -6,14 +6,86 @@ use tracing::{error, info};
 
 pub struct MeetingsRepository;
 
+/// Lifecycle value for a meeting whose recording is still in flight.
+pub const STATUS_RECORDING: &str = "recording";
+/// Lifecycle value for a meeting that finished normally.
+pub const STATUS_COMPLETED: &str = "completed";
+
 impl MeetingsRepository {
+    /// List finished meetings, most recent first.
+    ///
+    /// In-flight and interrupted recordings are excluded on purpose: this feeds
+    /// the sidebar, `meetily list-meetings` and `summarize --last`, and none of
+    /// those should ever land on a meeting that has no transcripts yet.
+    /// Interrupted recordings are reached through [`Self::get_incomplete_meetings`].
     pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingModel>, sqlx::Error> {
-        let meetings =
-            sqlx::query_as::<_, MeetingModel>("SELECT * FROM meetings ORDER BY created_at DESC")
-                .fetch_all(pool)
-                .await?;
+        let meetings = sqlx::query_as::<_, MeetingModel>(
+            "SELECT * FROM meetings WHERE status = ? ORDER BY created_at DESC",
+        )
+        .bind(STATUS_COMPLETED)
+        .fetch_all(pool)
+        .await?;
         Ok(meetings)
     }
+
+    /// Create the meeting row for a recording that is just starting.
+    ///
+    /// Called by every start path (UI and CLI) so an abruptly killed process
+    /// still leaves a discoverable record. Transcripts are attached later, on
+    /// finalization; until then the row only carries the title and the folder.
+    pub async fn create_recording_meeting(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        title: &str,
+        folder_path: Option<&str>,
+    ) -> Result<(), SqlxError> {
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path, status)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(meeting_id)
+        .bind(title)
+        .bind(now)
+        .bind(now)
+        .bind(folder_path)
+        .bind(STATUS_RECORDING)
+        .execute(pool)
+        .await?;
+
+        info!("Created in-progress meeting row {}", meeting_id);
+        Ok(())
+    }
+
+    /// Refresh `updated_at` on an in-progress recording.
+    ///
+    /// Acts as a heartbeat: recovery treats a row whose heartbeat is recent as a
+    /// live recording owned by another process (typically the CLI running while
+    /// the app is opened) rather than as a crash to offer for recovery.
+    pub async fn touch_recording(pool: &SqlitePool, meeting_id: &str) -> Result<(), SqlxError> {
+        sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ? AND status = ?")
+            .bind(Utc::now())
+            .bind(meeting_id)
+            .bind(STATUS_RECORDING)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Interrupted recordings: rows still flagged as in-progress, oldest first.
+    pub async fn get_incomplete_meetings(
+        pool: &SqlitePool,
+    ) -> Result<Vec<MeetingModel>, SqlxError> {
+        let meetings = sqlx::query_as::<_, MeetingModel>(
+            "SELECT * FROM meetings WHERE status != ? ORDER BY created_at ASC",
+        )
+        .bind(STATUS_COMPLETED)
+        .fetch_all(pool)
+        .await?;
+        Ok(meetings)
+    }
+
 
     pub async fn delete_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<bool, SqlxError> {
         if meeting_id.trim().is_empty() {
@@ -62,7 +134,7 @@ impl MeetingsRepository {
 
         // Get meeting details
         let meeting: Option<MeetingModel> =
-            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?")
+            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path, status FROM meetings WHERE id = ?")
                 .bind(meeting_id)
                 .fetch_optional(&mut *transaction)
                 .await?;
@@ -120,7 +192,7 @@ impl MeetingsRepository {
         }
 
         let meeting: Option<MeetingModel> =
-            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?")
+            sqlx::query_as("SELECT id, title, created_at, updated_at, folder_path, status FROM meetings WHERE id = ?")
                 .bind(meeting_id)
                 .fetch_optional(pool)
                 .await?;

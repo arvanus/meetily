@@ -171,10 +171,25 @@ impl ParakeetEngine {
         // Parakeet model configurations
         // Model name format: parakeet-tdt-0.6b-v{version}-{quantization}
         // Sizes match actual download sizes (encoder + decoder + preprocessor + vocab)
-        let model_configs = [
+        let mut model_configs = vec![
             ("parakeet-tdt-0.6b-v3-int8", 670, QuantizationType::Int8, "Ultra Fast (v3)", "Real time on M4 Max, latest version with int8 quantization"),
             ("parakeet-tdt-0.6b-v2-int8", 661, QuantizationType::Int8, "Fast (v2)", "Previous version with int8 quantization, good balance of speed and accuracy"),
         ];
+
+        // The fp32 weights are only offered on GPU-capable builds. They are the only
+        // variant the CUDA provider can actually accelerate - it implements too few QDQ
+        // ops to keep an int8 graph on the device - but at 2.5 GB and no quantization
+        // they are strictly slower than the int8 model when there is no GPU to run them
+        // on, so offering them on a CPU-only build would just be a 2.5 GB downgrade.
+        if cfg!(feature = "cuda") {
+            model_configs.push((
+                "parakeet-tdt-0.6b-v3-fp32",
+                2554,
+                QuantizationType::FP32,
+                "GPU (v3)",
+                "Full precision weights, accelerated on the GPU. Falls back to CPU if the CUDA 12 / cuDNN 9 runtime is missing, where it is slower than the int8 model",
+            ));
+        }
 
         // Get active downloads to override status
         let active_downloads = self.active_downloads.read().await;
@@ -197,8 +212,12 @@ impl ParakeetEngine {
                         "nemo128.onnx",
                         "vocab.txt",
                     ],
+                    // The fp32 encoder keeps its weights in an ONNX external data file
+                    // next to the graph; ORT resolves it relative to the .onnx path, so
+                    // both have to be present.
                     QuantizationType::FP32 => vec![
                         "encoder-model.onnx",
+                        "encoder-model.onnx.data",
                         "decoder_joint-model.onnx",
                         "nemo128.onnx",
                         "vocab.txt",
@@ -290,7 +309,8 @@ impl ParakeetEngine {
             ]
         } else {
             vec![
-                ("encoder-model.onnx", 2_200_000_000),        // ~2.44 GB, min 2.2 GB
+                ("encoder-model.onnx", 38_000_000),           // ~41.8 MB graph, min 38 MB
+                ("encoder-model.onnx.data", 2_200_000_000),   // ~2.44 GB weights, min 2.2 GB
                 ("decoder_joint-model.onnx", 65_000_000),     // ~72 MB, min 65 MB
                 ("nemo128.onnx", 100_000),                    // ~140 KB, min 100 KB
                 ("vocab.txt", 5_000),                         // ~94 KB, min 5 KB
@@ -443,6 +463,13 @@ impl ParakeetEngine {
     /// Get the currently loaded model name
     pub async fn get_current_model(&self) -> Option<String> {
         self.current_model_name.read().await.clone()
+    }
+
+    /// Execution provider the loaded model is running on ("CUDA" or "CPU"), or None when
+    /// no model is loaded. Reports what the sessions actually registered, so a CUDA build
+    /// that fell back for lack of runtime DLLs reads as "CPU".
+    pub async fn acceleration(&self) -> Option<&'static str> {
+        self.current_model.read().await.as_ref().map(|m| m.acceleration())
     }
 
     /// Check if a model is loaded
@@ -608,6 +635,7 @@ impl ParakeetEngine {
             ],
             QuantizationType::FP32 => vec![
                 "encoder-model.onnx",
+                "encoder-model.onnx.data",
                 "decoder_joint-model.onnx",
                 "nemo128.onnx",
                 "vocab.txt",
@@ -666,12 +694,13 @@ impl ParakeetEngine {
                 }
             }
             QuantizationType::FP32 => {
-                // FP32 model sizes (encoder has .onnx + .onnx.data)
+                // FP32 model sizes (encoder graph and its external weights are separate files)
                 [
-                    ("encoder-model.onnx", 41_800_000u64 + 2_440_000_000u64), // 41.8 MB + 2.44 GB
-                    ("decoder_joint-model.onnx", 72_500_000u64),               // 72.5 MB
-                    ("nemo128.onnx", 140_000u64),                              // 140 KB
-                    ("vocab.txt", 93_900u64),                                  // 93.9 KB
+                    ("encoder-model.onnx", 41_770_866u64),        // 41.8 MB graph
+                    ("encoder-model.onnx.data", 2_435_420_160u64), // 2.44 GB weights
+                    ("decoder_joint-model.onnx", 72_520_893u64),  // 72.5 MB
+                    ("nemo128.onnx", 139_764u64),                 // 140 KB
+                    ("vocab.txt", 93_900u64),                     // 93.9 KB
                 ].iter().cloned().collect()
             }
         };

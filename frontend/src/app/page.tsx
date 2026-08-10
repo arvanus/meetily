@@ -147,8 +147,12 @@ export default function Home() {
       const result = await recoverMeeting(meetingId);
 
       if (result.success) {
+        // Interrupted recordings left after this one. The dialog stays open for
+        // them, so nothing here may navigate away from this page while any remain.
+        const remaining = recoverableMeetings.filter(m => m.meetingId !== meetingId).length;
+
         toast.success('Meeting recovered successfully!', {
-          description: result.audioRecoveryStatus?.status === 'success'
+          description: result.audioStatus === 'success'
             ? 'Transcripts and audio recovered'
             : 'Transcripts recovered (no audio available)',
           action: result.meetingId ? {
@@ -163,16 +167,17 @@ export default function Home() {
         // Refresh sidebar to show the newly recovered meeting
         await refetchMeetings();
 
-        // If no more recoverable meetings, clear session flag so dialog can show again
-        if (recoverableMeetings.length === 0) {
+        if (remaining === 0) {
+          // Nothing left to recover: clear the session flag so the dialog can
+          // show again if new interrupted recordings appear, then open the
+          // meeting that was just recovered.
           sessionStorage.removeItem('recovery_dialog_shown');
-        }
 
-        // Auto-navigate after a short delay
-        if (result.meetingId) {
-          setTimeout(() => {
-            router.push(`/meeting-details?id=${result.meetingId}`);
-          }, 2000);
+          if (result.meetingId) {
+            setTimeout(() => {
+              router.push(`/meeting-details?id=${result.meetingId}`);
+            }, 2000);
+          }
         }
       }
     } catch (error) {

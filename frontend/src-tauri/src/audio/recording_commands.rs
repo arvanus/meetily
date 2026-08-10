@@ -57,6 +57,20 @@ static AUDIO_LEVEL_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 // were not pinned to a specific device in preferences. Cleaned up on stop.
 static DEFAULT_DEVICE_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
+// Meeting id of the row created when the current recording started. Kept after
+// stop so the save that follows can finalize that same row instead of creating a
+// duplicate meeting. Overwritten by the next recording.
+static CURRENT_RECORDING_MEETING_ID: Mutex<Option<String>> = Mutex::new(None);
+
+// Segments transcribed AFTER the recording manager was taken out of the global
+// (stop_recording step 1) and before the transcript listener is removed. The
+// listener has nowhere to put them at that point, so they land here and are
+// merged back into the manager right before the final transcripts.json write.
+// Without this, everything the workers drain during shutdown - exactly the tail
+// of the meeting - was missing from the saved transcript.
+static SHUTDOWN_SEGMENTS: Mutex<Vec<crate::audio::recording_saver::TranscriptSegment>> =
+    Mutex::new(Vec::new());
+
 // ============================================================================
 // PUBLIC TYPES
 // ============================================================================
@@ -76,6 +90,31 @@ pub struct TranscriptionStatus {
 // ============================================================================
 // HELPERS
 // ============================================================================
+
+/// Route a finished transcript segment to the recording manager, or park it in
+/// SHUTDOWN_SEGMENTS when the manager is already out of the global (shutdown in
+/// progress). Parked segments are merged back in `drain_shutdown_segments` before
+/// the final transcripts.json write, so the tail of the meeting is never dropped.
+fn persist_transcript_segment(segment: crate::audio::recording_saver::TranscriptSegment) {
+    if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
+        if let Some(manager) = manager_guard.as_ref() {
+            manager.add_transcript_segment(segment);
+            return;
+        }
+    }
+
+    if let Ok(mut pending) = SHUTDOWN_SEGMENTS.lock() {
+        pending.push(segment);
+    }
+}
+
+/// Take everything parked by `persist_transcript_segment` during shutdown.
+fn drain_shutdown_segments() -> Vec<crate::audio::recording_saver::TranscriptSegment> {
+    match SHUTDOWN_SEGMENTS.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(_) => Vec::new(),
+    }
+}
 
 /// Resolve the active transcription engine/model for persistence in transcripts.json.
 ///
@@ -124,6 +163,99 @@ async fn resolve_transcription_info<R: Runtime>(app: &AppHandle<R>) -> (String, 
         if use_parakeet { "parakeet" } else { "whisper" }.to_string(),
         model,
     )
+}
+
+/// Create the meeting row for a recording that is starting, and start its heartbeat.
+///
+/// Deliberately best-effort: a missing `AppState` (a fresh install whose database
+/// has not been wired yet) or a transient database error must never abort a
+/// recording. When it fails, capture proceeds exactly as it did before this flow
+/// existed - only crash recovery is unavailable for that session.
+///
+/// Returns the meeting id when the row was created.
+async fn register_recording_meeting<R: Runtime>(
+    app: &AppHandle<R>,
+    title: &str,
+) -> Option<String> {
+    use crate::database::repositories::meeting::MeetingsRepository;
+
+    // Scope the state guard so it is not held across an await point.
+    let pool = {
+        match app.try_state::<crate::state::AppState>() {
+            Some(state) => state.db_manager.pool().clone(),
+            None => {
+                warn!("Database unavailable: this recording will not be crash-recoverable");
+                *CURRENT_RECORDING_MEETING_ID.lock().unwrap() = None;
+                return None;
+            }
+        }
+    };
+
+    let meeting_id = format!("meeting-{}", uuid::Uuid::new_v4());
+
+    // The meeting folder is created while the manager starts, so it is already
+    // known here. It stays None when auto-save is off (transcripts only).
+    let folder_path = get_meeting_folder_path().await.ok().flatten();
+
+    if let Err(e) = MeetingsRepository::create_recording_meeting(
+        &pool,
+        &meeting_id,
+        title,
+        folder_path.as_deref(),
+    )
+    .await
+    {
+        warn!("Failed to create the in-progress meeting row: {}", e);
+        *CURRENT_RECORDING_MEETING_ID.lock().unwrap() = None;
+        return None;
+    }
+
+    *CURRENT_RECORDING_MEETING_ID.lock().unwrap() = Some(meeting_id.clone());
+    info!("📌 Recording registered as meeting {}", meeting_id);
+
+    spawn_recording_heartbeat(pool, meeting_id.clone());
+
+    Some(meeting_id)
+}
+
+/// Keep `updated_at` fresh while the recording runs.
+///
+/// Recovery uses the gap since the last heartbeat to tell a crashed recording
+/// from one that is still running in another process (typically the CLI while
+/// the desktop app is open), so this must outlive nothing but the recording.
+fn spawn_recording_heartbeat(pool: sqlx::SqlitePool, meeting_id: String) {
+    use crate::database::repositories::meeting::MeetingsRepository;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.tick().await; // The first tick completes immediately; skip it.
+
+        while IS_RECORDING.load(Ordering::SeqCst) {
+            interval.tick().await;
+            if !IS_RECORDING.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Err(e) = MeetingsRepository::touch_recording(&pool, &meeting_id).await {
+                warn!("Recording heartbeat failed for {}: {}", meeting_id, e);
+            }
+        }
+
+        info!("Recording heartbeat ended for {}", meeting_id);
+    });
+}
+
+/// Meeting id created when the current recording started, if any.
+///
+/// The frontend reads it right after `recording-started` and hands it back on
+/// save, so the pending row is finalized instead of duplicated.
+#[tauri::command]
+pub async fn get_current_recording_meeting_id() -> Result<Option<String>, String> {
+    Ok(CURRENT_RECORDING_MEETING_ID.lock().unwrap().clone())
+}
+
+/// Same as [`get_current_recording_meeting_id`], for in-process callers (the CLI).
+pub fn current_recording_meeting_id() -> Option<String> {
+    CURRENT_RECORDING_MEETING_ID.lock().unwrap().clone()
 }
 
 // ============================================================================
@@ -481,7 +613,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             now.format("%Y-%m-%d_%H-%M-%S")
         )
     });
-    manager.set_meeting_name(Some(effective_meeting_name));
+    manager.set_meeting_name(Some(effective_meeting_name.clone()));
 
     // Record which engine/model is producing the transcription (for transcripts.json).
     // Model is already loaded at this point (validated above).
@@ -523,6 +655,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     IS_RECORDING.store(true, Ordering::SeqCst);
     reset_speech_detected_flag(); // Reset for new recording session
+    let _ = drain_shutdown_segments(); // Drop leftovers from a previous session
+
+    // Create the meeting row now, not on stop, so a process that dies mid-recording
+    // still leaves something discoverable. Best-effort: never blocks the recording.
+    register_recording_meeting(&app, &effective_meeting_name).await;
 
     // Spawn audio level emission task - reads real RMS from pipeline and emits to frontend
     {
@@ -585,12 +722,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     sequence_id: update.sequence_id,
                 };
 
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
-                    }
-                }
+                // Save to recording manager (or to the shutdown buffer if the
+                // manager was already taken for cleanup)
+                persist_transcript_segment(segment);
             }
         });
         let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
@@ -685,7 +819,7 @@ pub async fn start_recording_only<R: Runtime>(
         let now = chrono::Local::now();
         format!("Meeting {}", now.format("%Y-%m-%d_%H-%M-%S"))
     });
-    manager.set_meeting_name(Some(effective_meeting_name));
+    manager.set_meeting_name(Some(effective_meeting_name.clone()));
 
     // DIFF vs normal path: no engine/model — recording without AI.
     // (`engine` is a String, `model` an Option; empty engine + None signals "no AI".)
@@ -737,6 +871,11 @@ pub async fn start_recording_only<R: Runtime>(
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     IS_RECORDING.store(true, Ordering::SeqCst);
     reset_speech_detected_flag(); // Reset for new recording session
+    let _ = drain_shutdown_segments(); // Drop leftovers from a previous session
+
+    // Create the meeting row now, not on stop, so a process that dies mid-recording
+    // still leaves something discoverable. Best-effort: never blocks the recording.
+    register_recording_meeting(&app, &effective_meeting_name).await;
 
     // KEEP (verbatim from normal path): audio-levels emit loop — reads real RMS
     // from pipeline and emits to frontend (mic/system RMS + FFT bands for panel).
@@ -882,7 +1021,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             now.format("%Y-%m-%d_%H-%M-%S")
         )
     });
-    manager.set_meeting_name(Some(effective_meeting_name));
+    manager.set_meeting_name(Some(effective_meeting_name.clone()));
 
     // Record which engine/model is producing the transcription (for transcripts.json).
     // Model is already loaded at this point (validated above).
@@ -921,6 +1060,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     IS_RECORDING.store(true, Ordering::SeqCst);
     reset_speech_detected_flag(); // Reset for new recording session
+    let _ = drain_shutdown_segments(); // Drop leftovers from a previous session
+
+    // Create the meeting row now, not on stop, so a process that dies mid-recording
+    // still leaves something discoverable. Best-effort: never blocks the recording.
+    register_recording_meeting(&app, &effective_meeting_name).await;
 
     // Start optimized parallel transcription task and store handle
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -951,12 +1095,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     sequence_id: update.sequence_id,
                 };
 
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
-                    }
-                }
+                // Save to recording manager (or to the shutdown buffer if the
+                // manager was already taken for cleanup)
+                persist_transcript_segment(segment);
             }
         });
         let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
@@ -1030,6 +1171,26 @@ pub async fn stop_recording<R: Runtime>(
         }
         Err(e) => {
             error!("❌ Failed to stop audio streams: {}", e);
+            // Bailing out here leaves the manager out of the global while the
+            // listener is still registered, so every segment the workers keep
+            // producing would pile up in SHUTDOWN_SEGMENTS forever. Tear the
+            // listener down and hand whatever was parked to the manager we hold.
+            {
+                use tauri::Listener;
+                if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
+                    app.unlisten(listener_id);
+                }
+            }
+            let tail = drain_shutdown_segments();
+            if !tail.is_empty() {
+                match manager_for_cleanup.as_ref() {
+                    Some(manager) => manager.add_transcript_segments(tail),
+                    None => warn!(
+                        "⚠️ {} segment(s) parked during shutdown were dropped (no recording manager)",
+                        tail.len()
+                    ),
+                }
+            }
             return Err(format!("Failed to stop audio streams: {}", e));
         }
     }
@@ -1110,6 +1271,28 @@ pub async fn stop_recording<R: Runtime>(
         if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
             app.unlisten(listener_id);
             info!("✅ Transcript-update listener removed (after all workers finished)");
+        }
+    }
+
+    // Step 2.6: Merge back everything transcribed AFTER the manager was taken in
+    // step 1. Those are the segments produced while the workers drained the queue
+    // (the end of the meeting) and the listener had no manager to write to.
+    {
+        let tail = drain_shutdown_segments();
+        if !tail.is_empty() {
+            match manager_for_cleanup.as_ref() {
+                Some(manager) => {
+                    info!(
+                        "🧩 Merging {} segment(s) transcribed during shutdown into the transcript",
+                        tail.len()
+                    );
+                    manager.add_transcript_segments(tail);
+                }
+                None => warn!(
+                    "⚠️ {} segment(s) transcribed during shutdown could not be saved (no recording manager)",
+                    tail.len()
+                ),
+            }
         }
     }
 

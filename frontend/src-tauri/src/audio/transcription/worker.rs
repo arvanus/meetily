@@ -159,6 +159,7 @@ pub fn start_transcription_task<R: Runtime>(
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
                             let chunk_is_partial = chunk.is_partial;
+                            let chunk_id_for_log = chunk.chunk_id;
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -171,24 +172,24 @@ pub fn start_transcription_task<R: Runtime>(
                                 Ok((transcript, confidence_opt, _is_partial_from_whisper)) => {
                                     // Use chunk-level partial flag (from VAD) instead of Whisper's
                                     let is_partial = chunk_is_partial;
-                                    // Provider-aware confidence threshold
-                                    let confidence_threshold = match &engine_clone {
-                                        TranscriptionEngine::Whisper(_) | TranscriptionEngine::Provider(_) => 0.3,
-                                        TranscriptionEngine::Parakeet(_) => 0.0, // Parakeet has no confidence, accept all
-                                    };
 
                                     let confidence_str = match confidence_opt {
                                         Some(c) => format!("{:.2}", c),
                                         None => "N/A".to_string(),
                                     };
 
-                                    info!("🔍 Worker {} transcription result: text='{}', confidence={}, partial={}, threshold={:.2}",
-                                          worker_id, transcript, confidence_str, is_partial, confidence_threshold);
+                                    info!("🔍 Worker {} transcription result: text='{}', confidence={}, partial={}",
+                                          worker_id, transcript, confidence_str, is_partial);
 
-                                    // Check confidence threshold (or accept if no confidence provided)
-                                    let meets_threshold = confidence_opt.map_or(true, |c| c >= confidence_threshold);
-
-                                    if !transcript.trim().is_empty() && meets_threshold {
+                                    // NO confidence gate: the "confidence" reported by the Whisper
+                                    // engine is a text-LENGTH proxy (segment_len/100 + 0.1), not an
+                                    // acoustic quality score. The old 0.3 threshold therefore meant
+                                    // "drop every transcript shorter than ~20 characters", silently
+                                    // killing short utterances ("All right.", "Bye, see you") - most
+                                    // visibly the last words of a meeting. Empty text is still the
+                                    // signal for "nothing was said"; the confidence value keeps
+                                    // flowing to the UI for display only.
+                                    if !transcript.trim().is_empty() {
                                         // PERFORMANCE: Only log transcription results, not every processing step
                                         info!("✅ Worker {} transcribed: {} (confidence: {}, partial: {})",
                                               worker_id, transcript, confidence_str, is_partial);
@@ -252,12 +253,12 @@ pub fn start_transcription_task<R: Runtime>(
                                             }
                                         }
                                         // PERFORMANCE: Removed verbose logging of every emission
-                                    } else if !transcript.trim().is_empty() && should_log_this_chunk
-                                    {
-                                        // PERFORMANCE: Only log low-confidence results occasionally
-                                        if let Some(c) = confidence_opt {
-                                            info!("Worker {} low-confidence transcription (confidence: {:.2}), skipping", worker_id, c);
-                                        }
+                                    } else if should_log_this_chunk {
+                                        // Empty result: silence or audio the engine could not decode
+                                        info!(
+                                            "Worker {} produced no text for chunk {} (silence or undecodable audio)",
+                                            worker_id, chunk_id_for_log
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -428,6 +429,30 @@ pub fn start_transcription_task<R: Runtime>(
     })
 }
 
+/// Minimum audio length handed to a transcription engine: 1.1s at 16kHz.
+/// Whisper returns ZERO segments below ~1s (its mel window needs 100 frames,
+/// i.e. exactly 16000 samples), so a short utterance came back as empty text,
+/// emitted no transcript-update and never reached the transcript. The usual
+/// victim was the last thing said before the user stopped the recording,
+/// force-ended by the VAD flush - the "missing final block". The extra 100ms
+/// over the hard limit is margin against rounding in the resampler output.
+const MIN_TRANSCRIBE_SAMPLES: usize = 17600;
+
+/// Segments shorter than this (300ms at 16kHz) are not padded: they are most
+/// likely noise blips, and stretching those into a full second of near-silence
+/// is a known way to make Whisper hallucinate filler ("Obrigado.", "Legenda...").
+const PAD_FLOOR_SAMPLES: usize = 4800;
+
+/// Pad a short speech segment with trailing silence so the engine can transcribe
+/// it. Returns whether padding was applied.
+fn pad_short_chunk(samples: &mut Vec<f32>) -> bool {
+    if !(PAD_FLOOR_SAMPLES..MIN_TRANSCRIBE_SAMPLES).contains(&samples.len()) {
+        return false;
+    }
+    samples.resize(MIN_TRANSCRIBE_SAMPLES, 0.0);
+    true
+}
+
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
 /// Returns: (text, confidence Option, is_partial)
 async fn transcribe_chunk_with_provider<R: Runtime>(
@@ -443,7 +468,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
     };
 
     // Skip VAD processing here since the pipeline already extracted speech using VAD
-    let speech_samples = transcription_data;
+    let mut speech_samples = transcription_data;
 
     // Check for empty samples - improved error handling
     if speech_samples.is_empty() {
@@ -455,6 +480,19 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             samples: 0,
             minimum: 1600, // 100ms at 16kHz
         });
+    }
+
+    // Give the engine at least one second of audio (see pad_short_chunk).
+    let original_len = speech_samples.len();
+    if pad_short_chunk(&mut speech_samples) {
+        info!(
+            "Padded short chunk {} with silence: {} → {} samples ({:.2}s → {:.2}s)",
+            chunk.chunk_id,
+            original_len,
+            speech_samples.len(),
+            original_len as f64 / 16000.0,
+            MIN_TRANSCRIBE_SAMPLES as f64 / 16000.0
+        );
     }
 
     // Calculate energy for logging/monitoring only
@@ -610,4 +648,36 @@ fn format_recording_time(seconds: f64) -> String {
     let secs = total_seconds % 60;
 
     format!("[{:02}:{:02}]", minutes, secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The final VAD-flushed utterance is typically well under a second. Before
+    /// padding, Whisper returned no segments for it and the words were lost.
+    #[test]
+    fn test_pad_short_chunk_pads_sub_second_speech() {
+        let mut samples = vec![0.5f32; 12000]; // 750ms
+        assert!(pad_short_chunk(&mut samples));
+        assert_eq!(samples.len(), MIN_TRANSCRIBE_SAMPLES);
+        assert_eq!(samples[11999], 0.5, "original audio must be preserved");
+        assert_eq!(samples[12000], 0.0, "padding must be silence");
+    }
+
+    #[test]
+    fn test_pad_short_chunk_leaves_long_audio_untouched() {
+        let mut samples = vec![0.5f32; 32000]; // 2s
+        assert!(!pad_short_chunk(&mut samples));
+        assert_eq!(samples.len(), 32000);
+    }
+
+    /// Noise blips stay short on purpose: padding them would feed Whisper a
+    /// second of near-silence, which is what makes it hallucinate filler text.
+    #[test]
+    fn test_pad_short_chunk_ignores_noise_blips() {
+        let mut samples = vec![0.5f32; 1600]; // 100ms
+        assert!(!pad_short_chunk(&mut samples));
+        assert_eq!(samples.len(), 1600);
+    }
 }

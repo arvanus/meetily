@@ -9,6 +9,15 @@ pub struct MeetingModel {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub folder_path: Option<String>,
+    /// Recording lifecycle: "recording" while capture is in flight, "completed"
+    /// once the meeting has been finalized. A row stuck at "recording" is an
+    /// interrupted session and shows up in the recovery flow.
+    #[serde(default = "default_meeting_status")]
+    pub status: String,
+}
+
+fn default_meeting_status() -> String {
+    "completed".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]

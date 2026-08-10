@@ -34,17 +34,22 @@ export class StorageService {
    * @param meetingTitle - Title of the meeting
    * @param transcripts - Array of transcript segments
    * @param folderPath - Optional folder path for audio file
+   * @param meetingId - Id of the row this recording created when it started.
+   *   When given, that meeting is finalized in place and keeps its id; without
+   *   it a brand new meeting is created (import and other non-recording saves).
    * @returns Promise with { meeting_id: string }
    */
   async saveMeeting(
     meetingTitle: string,
     transcripts: Transcript[],
-    folderPath: string | null
+    folderPath: string | null,
+    meetingId?: string | null
   ): Promise<SaveMeetingResponse> {
     return invoke<SaveMeetingResponse>('api_save_transcript', {
       meetingTitle,
       transcripts,
       folderPath,
+      meetingId: meetingId ?? null,
     });
   }
 
