@@ -16,6 +16,11 @@ pub enum AudioCaptureBackend {
     /// Uses direct Core Audio API with aggregate device + tap
     #[cfg(target_os = "macos")]
     CoreAudio,
+
+    /// PulseAudio backend (Linux only)
+    /// Captures a sink's monitor source, reaching PipeWire through pipewire-pulse
+    #[cfg(target_os = "linux")]
+    PulseAudio,
 }
 
 impl AudioCaptureBackend {
@@ -25,6 +30,8 @@ impl AudioCaptureBackend {
             AudioCaptureBackend::ScreenCaptureKit => "ScreenCaptureKit",
             #[cfg(target_os = "macos")]
             AudioCaptureBackend::CoreAudio => "Core Audio",
+            #[cfg(target_os = "linux")]
+            AudioCaptureBackend::PulseAudio => "PulseAudio",
         }
     }
 
@@ -38,6 +45,10 @@ impl AudioCaptureBackend {
             AudioCaptureBackend::CoreAudio => {
                 "Direct Core Audio API - Lower latency, more control over audio pipeline"
             }
+            #[cfg(target_os = "linux")]
+            AudioCaptureBackend::PulseAudio => {
+                "PulseAudio monitor sources - Works on both PipeWire and PulseAudio servers"
+            }
         }
     }
 
@@ -47,6 +58,8 @@ impl AudioCaptureBackend {
             "screencapturekit" => Some(AudioCaptureBackend::ScreenCaptureKit),
             #[cfg(target_os = "macos")]
             "coreaudio" | "core_audio" => Some(AudioCaptureBackend::CoreAudio),
+            #[cfg(target_os = "linux")]
+            "pulseaudio" | "pulse" => Some(AudioCaptureBackend::PulseAudio),
             _ => None,
         }
     }
@@ -57,6 +70,8 @@ impl AudioCaptureBackend {
             AudioCaptureBackend::ScreenCaptureKit => "screencapturekit".to_string(),
             #[cfg(target_os = "macos")]
             AudioCaptureBackend::CoreAudio => "coreaudio".to_string(),
+            #[cfg(target_os = "linux")]
+            AudioCaptureBackend::PulseAudio => "pulseaudio".to_string(),
         }
     }
 
@@ -67,7 +82,12 @@ impl AudioCaptureBackend {
             vec![AudioCaptureBackend::ScreenCaptureKit, AudioCaptureBackend::CoreAudio]
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            vec![AudioCaptureBackend::PulseAudio]
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             vec![AudioCaptureBackend::ScreenCaptureKit]
         }
@@ -78,7 +98,10 @@ impl AudioCaptureBackend {
         #[cfg(target_os = "macos")]
         return AudioCaptureBackend::CoreAudio;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        return AudioCaptureBackend::PulseAudio;
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return AudioCaptureBackend::ScreenCaptureKit;
     }
 }
@@ -182,10 +205,23 @@ mod tests {
     #[test]
     fn test_available_backends() {
         let backends = AudioCaptureBackend::available_backends();
-        assert!(backends.contains(&AudioCaptureBackend::ScreenCaptureKit));
+        assert!(!backends.is_empty());
 
         #[cfg(target_os = "macos")]
-        assert!(backends.contains(&AudioCaptureBackend::CoreAudio));
+        {
+            assert!(backends.contains(&AudioCaptureBackend::ScreenCaptureKit));
+            assert!(backends.contains(&AudioCaptureBackend::CoreAudio));
+        }
+
+        // Linux captures through the sound server, so ScreenCaptureKit - an Apple
+        // framework - is not among the options it offers.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(backends, vec![AudioCaptureBackend::PulseAudio]);
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert!(backends.contains(&AudioCaptureBackend::ScreenCaptureKit));
     }
 
     #[test]
@@ -193,7 +229,10 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(AudioCaptureBackend::default(), AudioCaptureBackend::CoreAudio);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        assert_eq!(AudioCaptureBackend::default(), AudioCaptureBackend::PulseAudio);
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         assert_eq!(AudioCaptureBackend::default(), AudioCaptureBackend::ScreenCaptureKit);
     }
 
@@ -202,11 +241,7 @@ mod tests {
         let config = BackendConfig::new();
 
         // Should start with default
-        #[cfg(target_os = "macos")]
-        assert_eq!(config.get(), AudioCaptureBackend::CoreAudio);
-
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(config.get(), AudioCaptureBackend::ScreenCaptureKit);
+        assert_eq!(config.get(), AudioCaptureBackend::default());
 
         #[cfg(target_os = "macos")]
         {
@@ -217,10 +252,6 @@ mod tests {
 
         // Test reset
         config.reset();
-        #[cfg(target_os = "macos")]
-        assert_eq!(config.get(), AudioCaptureBackend::CoreAudio);
-
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(config.get(), AudioCaptureBackend::ScreenCaptureKit);
+        assert_eq!(config.get(), AudioCaptureBackend::default());
     }
 }

@@ -57,30 +57,36 @@ pub fn silence_alsa_logging() {
     });
 }
 
-/// Configure Linux audio devices using ALSA/PulseAudio
+/// Enumerate Linux audio devices: microphones through ALSA, system audio through the
+/// sound server.
+///
+/// The two halves come from different places because they are captured from different
+/// places. Microphones are ALSA PCMs that cpal opens directly. System audio is a monitor
+/// source, which exists only inside PulseAudio or PipeWire - `snd_device_name_hint` never
+/// reports one, so anything looking for monitors among ALSA devices finds nothing, and
+/// anything offering ALSA playback devices as a substitute offers something that cannot be
+/// opened for capture at all.
 pub fn configure_linux_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
     let mut devices = Vec::new();
 
-    // Add input devices
     for device in host.input_devices()? {
         if let Ok(name) = device.name() {
             devices.push(AudioDevice::new(name, DeviceType::Input));
         }
     }
 
-    // Add PulseAudio monitor sources for system audio
-    if let Ok(pulse_host) = cpal::host_from_id(cpal::HostId::Alsa) {
-        for device in pulse_host.input_devices()? {
-            if let Ok(name) = device.name() {
-                // Check if it's a monitor source
-                if name.contains("monitor") {
-                    devices.push(AudioDevice::new(
-                        format!("{} (System Audio)", name),
-                        DeviceType::Output
-                    ));
-                }
+    // Names are the server's own, unadorned: they are what gets stored in the recording
+    // preferences and handed straight back to pa_simple_new when a recording starts.
+    //
+    // A server that is missing or unwell costs the user system audio, not the whole device
+    // list - losing the microphones too would turn a degraded setup into an unusable one.
+    match crate::audio::capture::list_monitor_sources() {
+        Ok(monitors) => {
+            for monitor in monitors {
+                devices.push(AudioDevice::new(monitor.name, DeviceType::Output));
             }
         }
+        Err(e) => log::warn!("System audio unavailable, listing microphones only: {}", e),
     }
 
     Ok(devices)

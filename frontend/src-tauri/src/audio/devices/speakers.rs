@@ -1,4 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+// Linux resolves its default through the sound server, which reports its own errors.
+#[cfg(not(target_os = "linux"))]
+use anyhow::anyhow;
 use cpal::traits::{HostTrait, DeviceTrait};
 use log::{info, warn};
 
@@ -35,7 +38,17 @@ pub fn default_output_device() -> Result<AudioDevice> {
         return Ok(AudioDevice::new(device.name()?, DeviceType::Output));
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        // Not cpal's default output device: that is a playback PCM, which cannot be opened
+        // for capture. What records system audio is the monitor source belonging to the
+        // sink the user currently listens through.
+        let monitor = crate::audio::capture::default_monitor_source()?;
+        info!("🔊 Default system audio source: {} ({})", monitor.description, monitor.name);
+        return Ok(AudioDevice::new(monitor.name, DeviceType::Output));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let host = cpal::default_host();
         let device = host

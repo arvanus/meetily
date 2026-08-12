@@ -154,19 +154,14 @@ pub async fn get_device_and_config(
 
                 #[cfg(target_os = "linux")]
                 {
-                    // For Linux, we use PulseAudio monitor sources for system audio
-                    if let Ok(pulse_host) = cpal::host_from_id(cpal::HostId::Alsa) {
-                        for device in pulse_host.input_devices()? {
-                            if let Ok(name) = device.name() {
-                                if name == audio_device.name {
-                                    let default_config = device
-                                        .default_input_config()
-                                        .map_err(|e| anyhow!("Failed to get default input config: {}", e))?;
-                                    return Ok((device, default_config));
-                                }
-                            }
-                        }
-                    }
+                    // Nothing to look up: system audio on Linux is a monitor source, which
+                    // cpal cannot represent as a Device. AudioStream routes those to the
+                    // PulseAudio backend before reaching this function, so arriving here
+                    // means a caller expects a cpal handle that cannot exist.
+                    return Err(anyhow!(
+                        "'{}' is a system audio source and is captured through PulseAudio, not cpal",
+                        audio_device.name
+                    ));
                 }
             }
         }

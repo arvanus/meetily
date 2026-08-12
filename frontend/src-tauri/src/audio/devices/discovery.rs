@@ -2,7 +2,10 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::error;
 
-use super::configuration::{AudioDevice, DeviceType};
+use super::configuration::AudioDevice;
+// Only the catch-all below labels devices, and that is compiled out on Linux.
+#[cfg(not(target_os = "linux"))]
+use super::configuration::DeviceType;
 use super::platform;
 
 /// List all available audio devices on the system
@@ -10,6 +13,10 @@ pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
 
     // Platform-specific device enumeration
+    //
+    // Nothing appends to this on Linux: the platform enumeration already returns the
+    // complete list there, and the catch-all below is compiled out.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
     let mut devices = {
         #[cfg(target_os = "windows")]
         {
@@ -28,6 +35,13 @@ pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
     };
 
     // Add any additional devices from the default host
+    //
+    // Skipped on Linux: `host.devices()` there is the ALSA device list, whose leftovers are
+    // playback PCMs (hdmi:, dmix:, the output half of every card). Labelling them Output
+    // advertises them as system audio sources, and opening one for capture fails - ALSA
+    // reports ENOENT. The platform enumeration above already returns the monitor sources
+    // that can actually be recorded.
+    #[cfg(not(target_os = "linux"))]
     if let Ok(other_devices) = host.devices() {
         for device in other_devices {
             if let Ok(name) = device.name() {

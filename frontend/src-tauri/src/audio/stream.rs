@@ -22,6 +22,11 @@ pub enum StreamBackend {
     CoreAudio {
         task: Option<tokio::task::JoinHandle<()>>,
     },
+    /// PulseAudio monitor capture (Linux system audio only)
+    ///
+    /// Holds the capture handle; dropping it stops the reader thread.
+    #[cfg(target_os = "linux")]
+    Pulse(super::capture::PulseCapture),
 }
 
 // SAFETY: While Stream doesn't implement Send, we ensure it's only accessed
@@ -85,6 +90,15 @@ impl AudioStream {
         if use_core_audio {
             info!("🎵 Stream: Using Core Audio backend (cidre) for system audio");
             return Self::create_core_audio_stream(device, state, device_type, recording_sender).await;
+        }
+
+        // System audio on Linux never goes through cpal: it lives on monitor sources, which
+        // are objects of the sound server and invisible to ALSA. Microphones still take the
+        // cpal path below, exactly like the other platforms.
+        #[cfg(target_os = "linux")]
+        if device_type == DeviceType::System {
+            info!("🎵 Stream: Using PulseAudio backend for system audio");
+            return Self::create_pulse_stream(device, state, device_type, recording_sender).await;
         }
 
         // Default path: use CPAL
@@ -233,6 +247,52 @@ impl AudioStream {
         })
     }
 
+    /// Create a PulseAudio monitor stream (Linux system audio only)
+    #[cfg(target_os = "linux")]
+    async fn create_pulse_stream(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        device_type: DeviceType,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+    ) -> Result<Self> {
+        // Asking the server for the pipeline's own format means it does the conversion from
+        // the monitor's native layout (s24-32le or s32le here), and the mixer never sees a
+        // rate it has to resample. Mono for the same reason the Core Audio tap is mono: the
+        // mix is mono downstream anyway.
+        const SAMPLE_RATE: u32 = 48000;
+        const CHANNELS: u8 = 1;
+
+        info!("🔊 Stream: Opening PulseAudio monitor source: {}", device.name);
+
+        let capture = AudioCapture::new(
+            device.clone(),
+            state.clone(),
+            SAMPLE_RATE,
+            CHANNELS as u16,
+            device_type,
+            recording_sender,
+        );
+
+        // Off the async worker: opening the stream is a synchronous handshake with the
+        // sound server, and a server that is slow to answer would otherwise stall this
+        // runtime thread - and everything queued behind it - for the whole timeout.
+        let source = device.name.clone();
+        let pulse_capture = tokio::task::spawn_blocking(move || {
+            super::capture::pulse::open(&source, SAMPLE_RATE, CHANNELS, move |samples| {
+                capture.process_audio_data(samples);
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("System audio task failed to run: {}", e))??;
+
+        info!("✅ Stream: PulseAudio stream started for device: {}", device.name);
+
+        Ok(Self {
+            device,
+            backend: StreamBackend::Pulse(pulse_capture),
+        })
+    }
+
     /// Build stream based on sample format
     fn build_stream(
         device: &Device,
@@ -342,6 +402,12 @@ impl AudioStream {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     info!("Core Audio task aborted");
                 }
+            }
+            #[cfg(target_os = "linux")]
+            StreamBackend::Pulse(capture) => {
+                // Dropping it signals the reader thread and joins it.
+                info!("Stopping PulseAudio capture on '{}'", capture.source());
+                drop(capture);
             }
         }
 

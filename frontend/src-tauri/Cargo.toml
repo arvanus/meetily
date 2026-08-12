@@ -222,6 +222,13 @@ futures-channel = "0.3.31"
 # Only for snd_lib_error_set_handler: ALSA logs its plugin probes to stderr on every
 # device enumeration. Already in the tree as a cpal dependency.
 alsa-sys = "0.3.1"
+# System audio capture. ALSA cannot reach it: monitor sources are PulseAudio objects and
+# never appear in snd_device_name_hint, so cpal can neither enumerate nor open one. The
+# Pulse protocol is what both servers speak - PipeWire through pipewire-pulse, PulseAudio
+# natively - which is why this is the portable choice rather than talking to either daemon
+# directly. Needs libpulse-dev to build and libpulse0 at run time.
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.28"
 
 [dev-dependencies]
 tempfile = "3.3.0"
