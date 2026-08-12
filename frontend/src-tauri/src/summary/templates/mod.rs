@@ -30,10 +30,13 @@
 //!
 //! # Custom Templates
 //!
-//! Users can add custom templates to:
-//! - macOS: `~/Library/Application Support/Meetily/templates/`
-//! - Windows: `%APPDATA%\Meetily\templates\`
-//! - Linux: `~/.config/Meetily/templates/`
+//! Users can add custom templates to `<app_data_dir>/templates`, created at startup:
+//! - macOS: `~/Library/Application Support/com.meetily.ai/templates/`
+//! - Windows: `%APPDATA%\com.meetily.ai\templates\`
+//! - Linux: `~/.local/share/com.meetily.ai/templates/`
+//!
+//! A file there whose name matches a bundled template replaces it, and unlike the bundled
+//! copies - which the installed package owns and overwrites - it survives a reinstall.
 //!
 //! Custom templates must follow the JSON schema defined in `types::Template`.
 
@@ -44,7 +47,7 @@ mod types;
 // Re-export public API
 pub use loader::{
     get_template, list_template_ids, list_templates, set_bundled_templates_dir,
-    validate_and_parse_template,
+    set_custom_templates_dir, validate_and_parse_template,
 };
 pub use types::{Template, TemplateSection};
 

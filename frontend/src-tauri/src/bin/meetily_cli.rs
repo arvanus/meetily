@@ -44,6 +44,19 @@ fn main() {
         log::warn!("Failed to resolve resource directory for templates");
     }
 
+    // Custom templates live under app_data_dir, not in the bundle, so that a user's edits
+    // survive reinstalling the app. The CLI has to resolve them for the same reason it has
+    // to resolve the bundled ones above.
+    match handle.path().app_data_dir() {
+        Ok(app_data_dir) => {
+            app_lib::summary::templates::set_custom_templates_dir(app_data_dir.join("templates"))
+        }
+        Err(e) => log::warn!(
+            "Failed to resolve app data directory for custom templates: {}",
+            e
+        ),
+    }
+
     // Sem subcomando = gravar com a config padrão do app (Record é o default).
     match cli.command.unwrap_or(Command::Record(RecordArgs::default())) {
         Command::ListDevices => {

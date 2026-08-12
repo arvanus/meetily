@@ -8,6 +8,9 @@ use std::sync::RwLock;
 // Global storage for the bundled templates directory path
 static BUNDLED_TEMPLATES_DIR: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
 
+// Global storage for the user's custom templates directory path
+static CUSTOM_TEMPLATES_DIR: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
+
 /// Set the bundled templates directory path (called once at app startup)
 pub fn set_bundled_templates_dir(path: PathBuf) {
     info!("Bundled templates directory set to: {:?}", path);
@@ -16,17 +19,41 @@ pub fn set_bundled_templates_dir(path: PathBuf) {
     }
 }
 
+/// Set the custom templates directory and create it if missing (called once at app startup)
+///
+/// Takes the directory rather than deriving it so that it comes from the same
+/// `app_data_dir()` the database and the models already resolve through - the bundle
+/// identifier lives in tauri.conf.json, and a copy of it here would be free to drift.
+/// Callers pass `<app_data_dir>/templates`.
+pub fn set_custom_templates_dir(path: PathBuf) {
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        // Not fatal: templates still resolve from the bundled and built-in sources
+        warn!("Failed to create custom templates directory {:?}: {}", path, e);
+        return;
+    }
+
+    info!("Custom templates directory set to: {:?}", path);
+    if let Ok(mut dir) = CUSTOM_TEMPLATES_DIR.write() {
+        *dir = Some(path);
+    }
+}
+
 /// Get the user's custom templates directory path
 ///
-/// Returns the platform-specific application data directory for custom templates:
-/// - macOS: ~/Library/Application Support/Meetily/templates/
-/// - Windows: %APPDATA%\Meetily\templates\
-/// - Linux: ~/.config/Meetily/templates/
+/// This is `<app_data_dir>/templates`, the same root the database and the downloaded
+/// models live under, so a user's templates survive reinstalling the app:
+/// - macOS: ~/Library/Application Support/com.meetily.ai/templates/
+/// - Windows: %APPDATA%\com.meetily.ai\templates\
+/// - Linux: ~/.local/share/com.meetily.ai/templates/
+///
+/// Returns None when [`set_custom_templates_dir`] has not run, which means custom
+/// templates are simply not available - bundled and built-in ones still resolve.
 fn get_custom_templates_dir() -> Option<PathBuf> {
-    let mut path = dirs::data_dir()?;
-    path.push("Meetily");
-    path.push("templates");
-    Some(path)
+    let dir = CUSTOM_TEMPLATES_DIR.read().ok()?.clone();
+    if dir.is_none() {
+        debug!("Custom templates directory was never set; skipping custom templates");
+    }
+    dir
 }
 
 /// Load a template from the bundled resources directory

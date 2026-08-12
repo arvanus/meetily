@@ -555,6 +555,18 @@ pub fn run() {
                 log::warn!("Failed to resolve resource directory for templates");
             }
 
+            // The user's own templates sit next to the database and the models rather than
+            // in the bundle, so editing one is not undone by reinstalling the app.
+            match _app.handle().path().app_data_dir() {
+                Ok(app_data_dir) => {
+                    summary::templates::set_custom_templates_dir(app_data_dir.join("templates"))
+                }
+                Err(e) => log::warn!(
+                    "Failed to resolve app data directory for custom templates: {}",
+                    e
+                ),
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
