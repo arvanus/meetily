@@ -16,6 +16,11 @@ fn main() {
     // register_backend, ...) para o `log` do Rust — com o default acima (warn),
     // esse ruído some e deixa de quebrar a linha de status do painel.
     whisper_rs::install_whisper_log_trampoline();
+    // Same idea for ALSA: enumerating devices makes libasound write its plugin probes to
+    // stderr, and the device monitor enumerates on a loop while recording, which shreds
+    // the status panel. Nothing is lost - the messages report plugins ALSA rejects itself.
+    #[cfg(target_os = "linux")]
+    app_lib::audio::devices::platform::silence_alsa_logging();
 
     let cli = Cli::parse();
     let app = runner::build_headless_app().expect("failed to build the headless app");

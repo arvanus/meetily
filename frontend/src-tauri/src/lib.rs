@@ -447,6 +447,10 @@ pub fn get_language_preference_internal() -> Option<String> {
 pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
 
+    // Before anything touches cpal: device enumeration otherwise floods stderr from ALSA.
+    #[cfg(target_os = "linux")]
+    audio::devices::platform::silence_alsa_logging();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())

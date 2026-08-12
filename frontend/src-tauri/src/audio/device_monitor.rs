@@ -77,6 +77,14 @@ impl MonitoredDevice {
     }
 }
 
+/// How often the monitor enumerates devices while one of them is missing
+const MISSING_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often it enumerates once every monitored device is present - the steady state of a
+/// normal recording. Each tick is a full enumeration, so this is the interval that decides
+/// what the monitor costs in practice.
+const PRESENT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Audio device monitor that detects disconnects and reconnects
 pub struct AudioDeviceMonitor {
     monitor_handle: Option<JoinHandle<()>>,
@@ -166,7 +174,10 @@ impl AudioDeviceMonitor {
         stop_signal: Arc<tokio::sync::Notify>,
     ) {
         let mut last_device_list = Vec::new();
-        let check_interval = Duration::from_secs(2); // Poll every 2 seconds
+        // Starts fast so a device that is already missing is noticed promptly, then backs
+        // off to PRESENT_POLL_INTERVAL once everything is accounted for - see the end of
+        // the loop. Each tick runs a full enumeration, which is the expensive part.
+        let mut check_interval = MISSING_POLL_INTERVAL;
 
         loop {
             // Check for stop signal with timeout
@@ -240,13 +251,17 @@ impl AudioDeviceMonitor {
             // If any device is missing, check more frequently
             let has_missing = monitored_devices.iter().any(|d| d.consecutive_missing > 0);
             let next_interval = if has_missing {
-                Duration::from_secs(2) // Fast polling when device missing
+                MISSING_POLL_INTERVAL
             } else {
-                Duration::from_secs(5) // Slower polling when all devices present
+                PRESENT_POLL_INTERVAL
             };
 
             if next_interval != check_interval {
-                debug!("Adjusting monitor interval to {:?}", next_interval);
+                debug!(
+                    "Adjusting monitor interval: {:?} -> {:?}",
+                    check_interval, next_interval
+                );
+                check_interval = next_interval;
             }
         }
     }

@@ -157,7 +157,21 @@ impl HardwareProfile {
     }
 
     fn has_cuda_support() -> bool {
-        // Check for CUDA environment or libraries
+        // whisper-rs links the CUDA runtime statically, so what has to be present at run
+        // time is the driver, not the toolkit. The toolkit checks below only hold for the
+        // machine that produced the build: the NVIDIA installers set CUDA_PATH and install
+        // under /usr/local/cuda, but distro packages (nvidia-cuda-toolkit) do neither, and
+        // an end user running a release build has a driver and no toolkit at all. Missing
+        // the driver here reports GpuType::None, which drops the profile to the Low tier
+        // and forces Whisper onto the CPU on a perfectly capable machine.
+        let has_driver = if cfg!(target_os = "windows") {
+            std::path::Path::new(r"C:\Windows\System32\nvcuda.dll").exists()
+        } else {
+            std::path::Path::new("/proc/driver/nvidia/version").exists()
+                || std::path::Path::new("/dev/nvidiactl").exists()
+        };
+
+        has_driver ||
         std::env::var("CUDA_PATH").is_ok() ||
         std::env::var("CUDA_HOME").is_ok() ||
         std::path::Path::new("/usr/local/cuda").exists()

@@ -16,9 +16,24 @@ echo ""
 
 # Export CUDA flags for Linux/NVIDIA
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    export CMAKE_CUDA_ARCHITECTURES=75
+    # ggml already detects the compute capability of the installed GPU, which beats the
+    # hardcoded 75 this used to force. Only forward an explicit override, and do it through
+    # CUDAARCHS because CMake does not read CMAKE_CUDA_ARCHITECTURES from the environment.
+    if [ -z "$CUDAARCHS" ] && [ -n "$CMAKE_CUDA_ARCHITECTURES" ]; then
+        export CUDAARCHS="$CMAKE_CUDA_ARCHITECTURES"
+    fi
     export CMAKE_CUDA_STANDARD=17
     export CMAKE_POSITION_INDEPENDENT_CODE=ON
+
+    # Distro CUDA packages (nvidia-cuda-toolkit) install the libraries into the multiarch
+    # directory rather than /usr/local/cuda/lib64, the only layout the find_cuda_helper
+    # crate looks at, so llama-cpp-sys-2 fails to link cudart_static. Point rustc at them.
+    if [ ! -d /usr/local/cuda/lib64 ] && [ ! -d /opt/cuda/lib64 ]; then
+        CUDA_MULTIARCH_LIB_DIR="/usr/lib/$(uname -m)-linux-gnu"
+        if [ -f "$CUDA_MULTIARCH_LIB_DIR/libcudart_static.a" ]; then
+            export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-L native=$CUDA_MULTIARCH_LIB_DIR"
+        fi
+    fi
 fi
 
 # Detect OS
