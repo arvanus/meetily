@@ -106,6 +106,13 @@
             "binaries/llama-helper",
             "binaries/ffmpeg"
         ],
+        "linux": {
+            "deb": {
+                "depends": [
+                    "libpulse0"
+                ]
+            }
+        },
         "macOS": {
             "entitlements": "entitlements.plist",
             "signingIdentity": "-",
