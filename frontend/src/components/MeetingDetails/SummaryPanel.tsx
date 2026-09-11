@@ -9,6 +9,7 @@ import { SummaryGeneratorButtonGroup } from './SummaryGeneratorButtonGroup';
 import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
 import Analytics from '@/lib/analytics';
 import { RefObject } from 'react';
+import { MeetingTagsButton } from '@/components/MeetingTags/MeetingTagsButton';
 
 interface SummaryPanelProps {
   meeting: {
@@ -132,6 +133,10 @@ export function SummaryPanel({
                 onOpenFolder={onOpenFolder}
                 hasSummary={!!aiSummary}
               />
+            </div>
+
+            <div className="flex-shrink-0">
+              <MeetingTagsButton meetingId={meeting.id} />
             </div>
           </div>
         )}

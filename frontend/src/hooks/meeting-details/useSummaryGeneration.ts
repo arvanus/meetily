@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { isOllamaNotInstalledError } from '@/lib/utils';
 import { BuiltInModelInfo } from '@/lib/builtin-ai';
+import { notifyTagsUpdated } from '@/services/tagService';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
@@ -232,6 +233,10 @@ export function useSummaryGeneration({
           if (meetingName) {
             updateMeetingTitle(meetingName);
           }
+
+          // The backend may have replaced the meeting tags while summarizing. Refetched
+          // after the local title update so its stale meeting list can't win.
+          notifyTagsUpdated();
 
           // Check if backend returned markdown format (new flow)
           if (pollingResult.data.markdown) {

@@ -8,7 +8,7 @@ use crate::{
     database::{
         models::MeetingModel,
         repositories::{
-            meeting::MeetingsRepository, setting::SettingsRepository,
+            meeting::MeetingsRepository, setting::SettingsRepository, tags::TagsRepository,
             transcript::TranscriptsRepository,
         },
     },
@@ -31,6 +31,25 @@ pub struct Meeting {
     pub id: String,
     pub title: String,
     pub created_at: String,
+    pub tags: Vec<MeetingTagSummary>,
+}
+
+/// The slice of a tag the meeting lists need to render chips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTagSummary {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "meetingCount")]
+    pub meeting_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,6 +182,59 @@ pub struct PaginatedTranscriptsResponse {
 pub struct SaveMeetingTitleRequest {
     pub meeting_id: String,
     pub title: String,
+}
+
+fn tag_from_model(tag: crate::database::models::TagModel) -> Tag {
+    Tag {
+        id: tag.id,
+        name: tag.name,
+        color: tag.color,
+        description: tag.description,
+        meeting_count: tag.meeting_count,
+    }
+}
+
+/// Validation failures carry a message meant for the user; anything else gets a prefix.
+fn tag_error_message(context: &str, error: &sqlx::Error) -> String {
+    match error {
+        sqlx::Error::Protocol(message) => message.clone(),
+        sqlx::Error::RowNotFound => "Tag not found".to_string(),
+        other => format!("{}: {}", context, other),
+    }
+}
+
+/// Converts meeting rows to the API shape, attaching each meeting's tags.
+async fn meetings_with_tags(
+    pool: &sqlx::SqlitePool,
+    meeting_models: Vec<MeetingModel>,
+) -> Vec<Meeting> {
+    let mut tags_by_meeting: HashMap<String, Vec<MeetingTagSummary>> = HashMap::new();
+    match TagsRepository::list_meeting_tag_links(pool).await {
+        Ok(links) => {
+            for link in links {
+                tags_by_meeting
+                    .entry(link.meeting_id)
+                    .or_default()
+                    .push(MeetingTagSummary {
+                        id: link.tag_id,
+                        name: link.name,
+                        color: link.color,
+                    });
+            }
+        }
+        // The meeting list is still useful without tags
+        Err(e) => log_warn!("Failed to load meeting tags for the meeting list: {}", e),
+    }
+
+    meeting_models
+        .into_iter()
+        .map(|m| Meeting {
+            tags: tags_by_meeting.remove(&m.id).unwrap_or_default(),
+            id: m.id,
+            title: m.title,
+            created_at: m.created_at.0.to_rfc3339(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -340,20 +412,158 @@ pub async fn api_get_meetings<R: Runtime>(
     match meetings {
         Ok(meeting_models) => {
             log_info!("Successfully got {} meetings", meeting_models.len());
-
-            let result: Vec<Meeting> = meeting_models
-                .into_iter()
-                .map(|m| Meeting {
-                    id: m.id,
-                    title: m.title,
-                    created_at: m.created_at.0.to_rfc3339(),
-                })
-                .collect();
-            Ok(result)
+            Ok(meetings_with_tags(pool, meeting_models).await)
         }
         Err(e) => {
             log_error!("Error getting meetings: {}", e);
             Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn api_list_tags<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Tag>, String> {
+    let pool = state.db_manager.pool();
+    TagsRepository::list_tags(pool)
+        .await
+        .map(|tags| tags.into_iter().map(tag_from_model).collect())
+        .map_err(|e| {
+            log_error!("Error listing tags: {}", e);
+            format!("Failed to list tags: {}", e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_create_tag<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    name: String,
+    color: Option<String>,
+    description: Option<String>,
+) -> Result<Tag, String> {
+    let pool = state.db_manager.pool();
+    TagsRepository::create_tag(pool, &name, color.as_deref(), description.as_deref())
+        .await
+        .map(tag_from_model)
+        .map_err(|e| {
+            log_error!("Error creating tag '{}': {}", name, e);
+            tag_error_message("Failed to create tag", &e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_update_tag<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    tag_id: String,
+    name: String,
+    color: Option<String>,
+    description: Option<String>,
+) -> Result<Tag, String> {
+    let pool = state.db_manager.pool();
+    TagsRepository::update_tag(pool, &tag_id, &name, color.as_deref(), description.as_deref())
+        .await
+        .map(tag_from_model)
+        .map_err(|e| {
+            log_error!("Error updating tag {}: {}", tag_id, e);
+            tag_error_message("Failed to update tag", &e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_delete_tag<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    tag_id: String,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    match TagsRepository::delete_tag(pool, &tag_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("Tag not found".to_string()),
+        Err(e) => {
+            log_error!("Error deleting tag {}: {}", tag_id, e);
+            Err(tag_error_message("Failed to delete tag", &e))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn api_get_auto_tag_setting<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::get_auto_tag_enabled(pool)
+        .await
+        .map_err(|e| {
+            log_error!("Error reading auto-tag setting: {}", e);
+            format!("Failed to read auto-tag setting: {}", e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_set_auto_tag_setting<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::set_auto_tag_enabled(pool, enabled)
+        .await
+        .map_err(|e| {
+            log_error!("Error saving auto-tag setting: {}", e);
+            format!("Failed to save auto-tag setting: {}", e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_get_meeting_tags<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<Tag>, String> {
+    let pool = state.db_manager.pool();
+    TagsRepository::get_meeting_tags(pool, &meeting_id)
+        .await
+        .map(|tags| tags.into_iter().map(tag_from_model).collect())
+        .map_err(|e| {
+            log_error!("Error getting tags for meeting {}: {}", meeting_id, e);
+            format!("Failed to get meeting tags: {}", e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_set_meeting_tags<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    tag_ids: Vec<String>,
+) -> Result<Vec<Tag>, String> {
+    let pool = state.db_manager.pool();
+    TagsRepository::set_meeting_tags(pool, &meeting_id, tag_ids)
+        .await
+        .map(|tags| tags.into_iter().map(tag_from_model).collect())
+        .map_err(|e| {
+            log_error!("Error setting tags for meeting {}: {}", meeting_id, e);
+            format!("Failed to save meeting tags: {}", e)
+        })
+}
+
+#[tauri::command]
+pub async fn api_get_meetings_for_tag<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    tag_id: String,
+) -> Result<Vec<Meeting>, String> {
+    let pool = state.db_manager.pool();
+    match TagsRepository::get_meetings_for_tag(pool, &tag_id).await {
+        Ok(meeting_models) => Ok(meetings_with_tags(pool, meeting_models).await),
+        Err(e) => {
+            log_error!("Error filtering meetings for tag {}: {}", tag_id, e);
+            Err(format!("Failed to filter meetings by tag: {}", e))
         }
     }
 }

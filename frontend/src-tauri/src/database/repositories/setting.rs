@@ -67,6 +67,34 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Whether summaries should assign meeting tags. Off when settings were never saved.
+    pub async fn get_auto_tag_enabled(pool: &SqlitePool) -> std::result::Result<bool, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT autoTagMeetings FROM settings LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.map(|(value,)| value != 0).unwrap_or(false))
+    }
+
+    pub async fn set_auto_tag_enabled(
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> std::result::Result<(), sqlx::Error> {
+        // Same seed row as save_api_key when the settings were never saved
+        sqlx::query(
+            r#"
+            INSERT INTO settings (id, provider, model, whisperModel, autoTagMeetings)
+            VALUES ('1', 'openai', 'gpt-4o-2024-11-20', 'large-v3', $1)
+            ON CONFLICT(id) DO UPDATE SET
+                autoTagMeetings = $1
+            "#,
+        )
+        .bind(enabled as i64)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_api_key(
         pool: &SqlitePool,
         provider: &str,

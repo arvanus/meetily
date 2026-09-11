@@ -6,11 +6,13 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SidebarItem } from './meetingGroups';
+import { MeetingListItem, MeetingTag, MeetingTagSummary, TAGS_UPDATED_EVENT, tagService } from '@/services/tagService';
 
 export interface CurrentMeeting {
   id: string;
   title: string;
   created_at?: string;
+  tags?: MeetingTagSummary[];
 }
 
 // Search result type for transcript search
@@ -29,6 +31,10 @@ interface SidebarContextType {
   toggleCollapse: () => void;
   meetings: CurrentMeeting[];
   setMeetings: (meetings: CurrentMeeting[]) => void;
+  tags: MeetingTag[];
+  selectedTagId: string | null;
+  setSelectedTagId: (tagId: string | null) => void;
+  refetchTags: () => Promise<void>;
   isMeetingActive: boolean;
   setIsMeetingActive: (active: boolean) => void;
   handleRecordingToggle: () => void;
@@ -62,6 +68,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [currentMeeting, setCurrentMeeting] = useState<CurrentMeeting | null>({ id: 'intro-call', title: '+ New Call' });
   const [isCollapsed, setIsCollapsed] = useState(true);
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
+  const [tags, setTags] = useState<MeetingTag[]>([]);
+  const [selectedTagId, setSelectedTagId] = useState<string | null>(null);
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
   const [searchResults, setSearchResults] = useState<any[]>([]);
@@ -80,11 +88,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, created_at: string }>;
-        const transformedMeetings = meetings.map((meeting: any) => ({
+        const meetings = selectedTagId
+          ? await tagService.getMeetingsForTag(selectedTagId)
+          : await invoke<MeetingListItem[]>('api_get_meetings');
+        const transformedMeetings = meetings.map((meeting) => ({
           id: meeting.id,
           title: meeting.title,
-          created_at: meeting.created_at
+          created_at: meeting.created_at,
+          tags: meeting.tags ?? []
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -94,11 +105,40 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         Analytics.trackBackendConnection(false, error instanceof Error ? error.message : 'Unknown error');
       }
     }
-  }, [serverAddress]);
+  }, [serverAddress, selectedTagId]);
+
+  const fetchTags = React.useCallback(async () => {
+    if (!serverAddress) return;
+
+    try {
+      const nextTags = await tagService.listTags();
+      setTags(nextTags);
+      if (selectedTagId && !nextTags.some((tag) => tag.id === selectedTagId)) {
+        setSelectedTagId(null);
+      }
+    } catch (error) {
+      console.error('Error fetching tags:', error);
+      setTags([]);
+    }
+  }, [serverAddress, selectedTagId]);
 
   useEffect(() => {
     fetchMeetings();
   }, [serverAddress, fetchMeetings]);
+
+  useEffect(() => {
+    fetchTags();
+  }, [serverAddress, fetchTags]);
+
+  useEffect(() => {
+    const onTagsUpdated = () => {
+      void fetchTags();
+      void fetchMeetings();
+    };
+
+    window.addEventListener(TAGS_UPDATED_EVENT, onTagsUpdated);
+    return () => window.removeEventListener(TAGS_UPDATED_EVENT, onTagsUpdated);
+  }, [fetchTags, fetchMeetings]);
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -293,6 +333,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       toggleCollapse,
       meetings,
       setMeetings,
+      tags,
+      selectedTagId,
+      setSelectedTagId,
+      refetchTags: fetchTags,
       isMeetingActive,
       setIsMeetingActive,
       handleRecordingToggle,

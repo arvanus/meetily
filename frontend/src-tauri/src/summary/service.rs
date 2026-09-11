@@ -1,6 +1,7 @@
 use crate::database::repositories::{
     meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
 };
+use crate::summary::auto_tag::{auto_tag_meeting, LlmTarget};
 use crate::summary::llm_client::LLMProvider;
 use crate::summary::processor::{extract_meeting_name_from_markdown, generate_meeting_summary};
 use crate::ollama::metadata::ModelMetadataCache;
@@ -24,6 +25,15 @@ static CANCELLATION_REGISTRY: Lazy<Arc<Mutex<HashMap<String, CancellationToken>>
 
 /// Summary service - handles all summary generation logic
 pub struct SummaryService;
+
+/// Removes a meeting's cancellation token when processing ends, on every return path.
+struct CancellationTokenGuard(String);
+
+impl Drop for CancellationTokenGuard {
+    fn drop(&mut self) {
+        SummaryService::cleanup_cancellation_token(&self.0);
+    }
+}
 
 impl SummaryService {
     /// Registers a new cancellation token for a meeting
@@ -72,6 +82,8 @@ impl SummaryService {
     /// * `model_name` - Specific model (e.g., "gpt-4", "llama3.2:latest")
     /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
     ///
+    /// * `auto_tag` - Whether to let the LLM replace the meeting tags; `None` uses the setting
+    ///
     /// The per-meeting context (textarea + file attachments) is loaded from
     /// the database internally; it is not a parameter.
     pub async fn process_transcript_background<R: tauri::Runtime>(
@@ -82,6 +94,7 @@ impl SummaryService {
         model_provider: String,
         model_name: String,
         template_id: String,
+        auto_tag: Option<bool>,
     ) {
         let start_time = Instant::now();
         info!(
@@ -89,8 +102,10 @@ impl SummaryService {
             meeting_id
         );
 
-        // Register cancellation token for this meeting
+        // Register cancellation token for this meeting. It stays registered until the
+        // function returns, so the auto-tag call after the summary can be cancelled too.
         let cancellation_token = Self::register_cancellation_token(&meeting_id);
+        let _cancellation_guard = CancellationTokenGuard(meeting_id.clone());
 
         // Parse provider
         let provider = match LLMProvider::from_str(&model_provider) {
@@ -220,11 +235,15 @@ impl SummaryService {
         // Get app data directory for BuiltInAI provider
         let app_data_dir = _app.path().app_data_dir().ok();
 
-        // Fetch meeting date for LLM context
-        let meeting_date = match MeetingsRepository::get_meeting_metadata(&pool, &meeting_id).await {
-            Ok(Some(m)) => Some(m.created_at.0.format("%Y-%m-%d %H:%M").to_string()),
-            _ => None,
-        };
+        // Fetch meeting date for LLM context, and the current title for auto-tagging
+        let (meeting_date, meeting_title) =
+            match MeetingsRepository::get_meeting_metadata(&pool, &meeting_id).await {
+                Ok(Some(m)) => (
+                    Some(m.created_at.0.format("%Y-%m-%d %H:%M").to_string()),
+                    Some(m.title),
+                ),
+                _ => (None, None),
+            };
 
         // Load persisted context_prompt (free-form textarea) and attachments.
         let context_prompt = crate::summary::context::repository::SummaryContextRepository::get_prompt(
@@ -294,9 +313,6 @@ impl SummaryService {
 
         let duration = start_time.elapsed().as_secs_f64();
 
-        // Clean up cancellation token regardless of outcome
-        Self::cleanup_cancellation_token(&meeting_id);
-
         match result {
             Ok((mut final_markdown, num_chunks)) => {
                 if num_chunks == 0 && final_markdown.is_empty() {
@@ -315,8 +331,11 @@ impl SummaryService {
                 );
                 info!("final markdown is {}", &final_markdown);
 
+                let summary_title = extract_meeting_name_from_markdown(&final_markdown)
+                    .filter(|name| !name.is_empty());
+
                 // Extract and update meeting name if present
-                if let Some(name) = extract_meeting_name_from_markdown(&final_markdown) {
+                if let Some(name) = summary_title.clone() {
                     if !name.is_empty() {
                         info!(
                             "Updating meeting name to '{}' for meeting_id: {}",
@@ -344,6 +363,51 @@ impl SummaryService {
                             // No '#' found, clear the string
                             final_markdown.clear();
                         }
+                    }
+                }
+
+                // Runs before the process is marked completed, so the UI polling sees the
+                // new tags together with the summary
+                let auto_tag_enabled = match auto_tag {
+                    Some(enabled) => enabled,
+                    None => SettingsRepository::get_auto_tag_enabled(&pool)
+                        .await
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to read the auto-tag setting, skipping auto-tag: {}", e);
+                            false
+                        }),
+                };
+
+                if auto_tag_enabled {
+                    let title = summary_title.or(meeting_title).unwrap_or_default();
+                    let target = LlmTarget {
+                        client: &client,
+                        provider: &provider,
+                        model_name: &model_name,
+                        api_key: &final_api_key,
+                        ollama_endpoint: ollama_endpoint.as_deref(),
+                        custom_openai_endpoint: custom_openai_endpoint.as_deref(),
+                        max_tokens: custom_openai_max_tokens,
+                        temperature: custom_openai_temperature,
+                        top_p: custom_openai_top_p,
+                        app_data_dir: app_data_dir.as_ref(),
+                        cancellation_token: Some(&cancellation_token),
+                    };
+
+                    match auto_tag_meeting(&pool, &target, &meeting_id, &title, &final_markdown).await {
+                        Ok(Some(tags)) => info!(
+                            "Auto-tagged meeting {} with [{}]",
+                            meeting_id,
+                            tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ),
+                        Ok(None) => info!(
+                            "Auto-tag skipped for meeting {}: no tags defined or empty summary",
+                            meeting_id
+                        ),
+                        Err(e) => warn!(
+                            "Auto-tag failed for meeting {}, tags left unchanged: {}",
+                            meeting_id, e
+                        ),
                     }
                 }
 
