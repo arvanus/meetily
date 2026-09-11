@@ -20,6 +20,26 @@ fn default_meeting_status() -> String {
     "completed".to_string()
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct TagModel {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub meeting_count: i64,
+}
+
+/// One meeting/tag pair, used to attach tags to meeting lists without a query per meeting.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct MeetingTagLink {
+    pub meeting_id: String,
+    pub tag_id: String,
+    pub name: String,
+    pub color: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct DateTimeUtc(pub DateTime<Utc>);

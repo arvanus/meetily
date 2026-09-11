@@ -1033,7 +1033,14 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
     // A failure here is a warning only: the recording is already persisted, so the
     // command still exits successfully.
     if args.summarize {
-        match summarize_existing_meeting(app, meeting_id, args.template.clone()).await {
+        match summarize_existing_meeting(
+            app,
+            meeting_id,
+            args.template.clone(),
+            args.auto_tag_override(),
+        )
+        .await
+        {
             Ok(()) => println!("✓ Summary saved. meeting_id={}", meeting_id),
             Err(e) => eprintln!(
                 "Warning: --summarize failed (the recording was saved): {}",
@@ -1095,8 +1102,11 @@ pub async fn summarize_meeting(
     provider: String,
     model: String,
     template_id: String,
+    auto_tag: Option<bool>,
 ) -> Result<(), String> {
+    use crate::database::repositories::setting::SettingsRepository;
     use crate::database::repositories::summary::SummaryProcessesRepository;
+    use crate::database::repositories::tags::TagsRepository;
     use crate::database::repositories::transcript_chunk::TranscriptChunksRepository;
     use crate::summary::service::SummaryService;
 
@@ -1141,6 +1151,7 @@ pub async fn summarize_meeting(
         provider,
         model,
         template_id,
+        auto_tag,
     )
     .await;
 
@@ -1151,7 +1162,26 @@ pub async fn summarize_meeting(
 
     // Confirma pelo status persistido.
     match SummaryProcessesRepository::get_summary_data(&pool, meeting_id).await {
-        Ok(Some(p)) if p.status.to_lowercase() == "completed" => Ok(()),
+        Ok(Some(p)) if p.status.to_lowercase() == "completed" => {
+            let auto_tag_enabled = match auto_tag {
+                Some(enabled) => enabled,
+                None => SettingsRepository::get_auto_tag_enabled(&pool)
+                    .await
+                    .unwrap_or(false),
+            };
+            // Auto-tag failures only reach the log, so show where the tags ended up
+            if auto_tag_enabled {
+                match TagsRepository::get_meeting_tags(&pool, meeting_id).await {
+                    Ok(tags) if tags.is_empty() => println!("Tags: (none)"),
+                    Ok(tags) => println!(
+                        "Tags: {}",
+                        tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                    Err(e) => eprintln!("Warning: failed to read the meeting tags: {}", e),
+                }
+            }
+            Ok(())
+        }
         Ok(Some(p)) => Err(p
             .error
             .unwrap_or_else(|| format!("summary did not complete (status: {})", p.status))),
@@ -1351,7 +1381,13 @@ pub async fn run_retranscribe(
     .await?;
 
     if args.summarize {
-        summarize_existing_meeting(app, &meeting_id, args.template.clone()).await?;
+        summarize_existing_meeting(
+            app,
+            &meeting_id,
+            args.template.clone(),
+            args.auto_tag_override(),
+        )
+        .await?;
         println!("✓ Summary saved. meeting_id={}", meeting_id);
     }
 
@@ -1364,6 +1400,7 @@ async fn summarize_existing_meeting(
     app: &tauri::AppHandle,
     meeting_id: &str,
     template: Option<String>,
+    auto_tag: Option<bool>,
 ) -> Result<(), String> {
     use crate::database::repositories::{
         meeting::MeetingsRepository, setting::SettingsRepository,
@@ -1417,7 +1454,7 @@ async fn summarize_existing_meeting(
         }
     };
 
-    summarize_meeting(app, meeting_id, text, provider, model, template_id).await
+    summarize_meeting(app, meeting_id, text, provider, model, template_id, auto_tag).await
 }
 
 /// Gera o sumário de uma reunião existente, escolhida por `--meeting <id>` ou
@@ -1441,7 +1478,13 @@ pub async fn run_summarize(app: &tauri::AppHandle, args: SummarizeArgs) -> Resul
             .ok_or_else(|| "No meetings found.".to_string())?
     };
 
-    summarize_existing_meeting(app, &meeting_id, args.template.clone()).await?;
+    summarize_existing_meeting(
+        app,
+        &meeting_id,
+        args.template.clone(),
+        args.auto_tag_override(),
+    )
+    .await?;
 
     println!("✓ Summary saved. meeting_id={}", meeting_id);
     Ok(())

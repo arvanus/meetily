@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, Tag as TagIcon, ListFilter } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -13,6 +13,8 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
+import { TagChip, TagColorDot } from '@/components/MeetingTags/TagChip';
+import type { MeetingTagSummary } from '@/services/tagService';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useImportDialog } from '@/contexts/ImportDialogContext';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -38,6 +40,9 @@ import type { DateRange } from 'react-day-picker';
 import { isWithinInterval, startOfDay, endOfDay, isSameDay, format } from 'date-fns';
 import { groupMeetingsByDay, parseMeetingDate, type SidebarItem } from './meetingGroups';
 
+// Tag chips shown on a meeting row before collapsing the rest into "+N"
+const MAX_ROW_TAGS = 2;
+
 const Sidebar: React.FC = () => {
   const router = useRouter();
   const pathname = usePathname();
@@ -53,6 +58,9 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
+    tags,
+    selectedTagId,
+    setSelectedTagId,
     serverAddress
   } = useSidebar();
 
@@ -268,6 +276,14 @@ const Sidebar: React.FC = () => {
 
   const recordDates = useMemo(() => Array.from(meetingDateById.values()), [meetingDateById]);
 
+  const meetingTagsById = useMemo(() => {
+    const map = new Map<string, MeetingTagSummary[]>();
+    meetings.forEach(meeting => {
+      if (meeting.tags?.length) map.set(meeting.id, meeting.tags);
+    });
+    return map;
+  }, [meetings]);
+
   const isWithinDateRange = useCallback((meetingId: string) => {
     if (!dateRange?.from) return true;
     const date = meetingDateById.get(meetingId);
@@ -460,7 +476,10 @@ const Sidebar: React.FC = () => {
           <Tooltip>
             <TooltipTrigger asChild>
               <button
-                onClick={() => router.push('/')}
+                onClick={() => {
+                  setSelectedTagId(null);
+                  router.push('/');
+                }}
                 className={`p-2 rounded-lg transition-colors duration-150 ${isHomePage ? 'bg-gray-100' : 'hover:bg-gray-100'
                   }`}
               >
@@ -564,6 +583,9 @@ const Sidebar: React.FC = () => {
 
     // The day group header carries the date, so the row only needs the time
     const meetingDate = isMeetingItem ? meetingDateById.get(item.id) : undefined;
+    const meetingTags = isMeetingItem ? meetingTagsById.get(item.id) ?? [] : [];
+    const visibleTags = meetingTags.slice(0, MAX_ROW_TAGS);
+    const hiddenTags = meetingTags.slice(MAX_ROW_TAGS);
 
     if (isCollapsed) return null;
 
@@ -650,6 +672,24 @@ const Sidebar: React.FC = () => {
                   </div>
                 )}
               </div>
+
+              {meetingTags.length > 0 && (
+                <div className="mt-1 ml-8 flex items-center gap-1 min-w-0">
+                  {visibleTags.map(tag => (
+                    <TagChip key={tag.id} name={tag.name} color={tag.color} />
+                  ))}
+                  {hiddenTags.length > 0 && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="shrink-0 text-[10px] leading-4 text-gray-500">+{hiddenTags.length}</span>
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        {hiddenTags.map(tag => tag.name).join(', ')}
+                      </TooltipContent>
+                    </Tooltip>
+                  )}
+                </div>
+              )}
 
               {/* Show transcript match snippet if available */}
               {hasTranscriptMatch && (
@@ -781,7 +821,10 @@ const Sidebar: React.FC = () => {
           <div className="flex-shrink-0">
             {!isCollapsed && (
               <div
-                onClick={() => router.push('/')}
+                onClick={() => {
+                  setSelectedTagId(null);
+                  router.push('/');
+                }}
                 className="p-3  text-lg font-semibold items-center hover:bg-gray-100 h-10   flex mx-3 mt-3 rounded-lg cursor-pointer"
               >
                 <Home className="w-4 h-4 mr-2" />
@@ -793,6 +836,40 @@ const Sidebar: React.FC = () => {
           {/* Content area */}
           <div className="flex-1 flex flex-col min-h-0">
             {renderCollapsedIcons()}
+            {!isCollapsed && tags.length > 0 && (
+              <div className="flex-shrink-0 mx-3 mt-3">
+                <div className="flex items-center px-3 py-2 text-sm font-semibold text-gray-500">
+                  <TagIcon className="w-4 h-4 mr-2" />
+                  <span>Tags</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedTagId(null)}
+                  className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-colors ${
+                    selectedTagId === null ? 'bg-blue-50 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-50'
+                  }`}
+                >
+                  <ListFilter className="w-4 h-4 text-gray-500" />
+                  <span className="flex-1 text-left">All meetings</span>
+                </button>
+                <div className="max-h-36 overflow-y-auto custom-scrollbar">
+                  {tags.map(tag => (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      onClick={() => setSelectedTagId(tag.id)}
+                      className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-colors ${
+                        selectedTagId === tag.id ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-700 hover:bg-gray-50'
+                      }`}
+                    >
+                      <TagColorDot color={tag.color} className="mx-[3px]" />
+                      <span className="flex-1 truncate text-left">{tag.name}</span>
+                      <span className="text-xs text-gray-400">{tag.meetingCount}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Scrollable meeting items, grouped by day */}
             {!isCollapsed && (

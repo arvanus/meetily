@@ -30,6 +30,7 @@ pub struct CustomOpenAIConfig {
     pub top_p: Option<f32>,
 }
 
+pub mod auto_tag;
 pub mod commands;
 pub mod context;
 pub mod file_export;

@@ -233,6 +233,7 @@ pub async fn api_process_transcript<R: Runtime>(
             model,
             model_name,
             final_template_id,
+            None,
         )
         .await;
     });

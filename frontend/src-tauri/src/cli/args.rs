@@ -85,10 +85,41 @@ pub struct RecordArgs {
     /// Template id used when --summarize is set (default: "daily_standup")
     #[arg(long)]
     pub template: Option<String>,
+    /// With --summarize, let the AI replace the meeting tags (overrides the app setting)
+    #[arg(long, conflicts_with = "no_auto_tag")]
+    pub auto_tag: bool,
+    /// With --summarize, leave the meeting tags alone (overrides the app setting)
+    #[arg(long)]
+    pub no_auto_tag: bool,
+}
+
+/// `--auto-tag` / `--no-auto-tag` as an override of the app setting; `None` keeps the setting.
+fn auto_tag_override(auto_tag: bool, no_auto_tag: bool) -> Option<bool> {
+    match (auto_tag, no_auto_tag) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+fn validate_auto_tag_needs_summarize(
+    summarize: bool,
+    auto_tag: bool,
+    no_auto_tag: bool,
+) -> Result<(), String> {
+    if (auto_tag || no_auto_tag) && !summarize {
+        return Err("--auto-tag/--no-auto-tag require --summarize.".to_string());
+    }
+    Ok(())
 }
 
 impl RecordArgs {
+    pub fn auto_tag_override(&self) -> Option<bool> {
+        auto_tag_override(self.auto_tag, self.no_auto_tag)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        validate_auto_tag_needs_summarize(self.summarize, self.auto_tag, self.no_auto_tag)?;
         if self.record_only && self.no_audio_save {
             return Err(
                 "--record-only requires saving the audio (it is the source for re-transcription); remove --no-audio-save."
@@ -147,10 +178,21 @@ pub struct RetranscribeArgs {
     /// Template id used when --summarize is set (default: "daily_standup")
     #[arg(long)]
     pub template: Option<String>,
+    /// With --summarize, let the AI replace the meeting tags (overrides the app setting)
+    #[arg(long, conflicts_with = "no_auto_tag")]
+    pub auto_tag: bool,
+    /// With --summarize, leave the meeting tags alone (overrides the app setting)
+    #[arg(long)]
+    pub no_auto_tag: bool,
 }
 
 impl RetranscribeArgs {
+    pub fn auto_tag_override(&self) -> Option<bool> {
+        auto_tag_override(self.auto_tag, self.no_auto_tag)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        validate_auto_tag_needs_summarize(self.summarize, self.auto_tag, self.no_auto_tag)?;
         match (self.meeting.is_some(), self.last) {
             (true, true) => Err("use either --meeting <id> or --last, not both.".to_string()),
             (false, false) => {
@@ -172,9 +214,19 @@ pub struct SummarizeArgs {
     /// Template id (default: "daily_standup"); see `list-templates`
     #[arg(long)]
     pub template: Option<String>,
+    /// Let the AI replace the meeting tags (overrides the app setting)
+    #[arg(long, conflicts_with = "no_auto_tag")]
+    pub auto_tag: bool,
+    /// Leave the meeting tags alone (overrides the app setting)
+    #[arg(long)]
+    pub no_auto_tag: bool,
 }
 
 impl SummarizeArgs {
+    pub fn auto_tag_override(&self) -> Option<bool> {
+        auto_tag_override(self.auto_tag, self.no_auto_tag)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match (self.meeting.is_some(), self.last) {
             (true, true) => {
@@ -343,6 +395,61 @@ mod tests {
         assert_eq!(args.meeting.as_deref(), Some("abc"));
         assert_eq!(args.model, "large-v3");
         assert!(args.summarize);
+    }
+
+    #[test]
+    fn summarize_auto_tag_flags_override_the_setting() {
+        let cli = Cli::parse_from(["meetily-cli", "summarize", "--last"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert_eq!(args.auto_tag_override(), None);
+
+        let cli = Cli::parse_from(["meetily-cli", "summarize", "--last", "--auto-tag"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert_eq!(args.auto_tag_override(), Some(true));
+
+        let cli = Cli::parse_from(["meetily-cli", "summarize", "--last", "--no-auto-tag"]);
+        let Some(Command::Summarize(args)) = cli.command else { panic!("expected Summarize") };
+        assert_eq!(args.auto_tag_override(), Some(false));
+    }
+
+    #[test]
+    fn auto_tag_and_no_auto_tag_conflict() {
+        let result = Cli::try_parse_from([
+            "meetily-cli",
+            "summarize",
+            "--last",
+            "--auto-tag",
+            "--no-auto-tag",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn record_auto_tag_requires_summarize() {
+        let cli = Cli::parse_from(["meetily-cli", "record", "--auto-tag"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_err());
+
+        let cli = Cli::parse_from(["meetily-cli", "record", "--summarize", "--no-auto-tag"]);
+        let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
+        assert!(args.validate().is_ok());
+        assert_eq!(args.auto_tag_override(), Some(false));
+    }
+
+    #[test]
+    fn retranscribe_auto_tag_requires_summarize() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "retranscribe",
+            "--last",
+            "--model",
+            "large-v3",
+            "--auto-tag",
+        ]);
+        let Some(Command::Retranscribe(args)) = cli.command else {
+            panic!("expected Retranscribe")
+        };
+        assert!(args.validate().is_err());
     }
 
     #[test]
