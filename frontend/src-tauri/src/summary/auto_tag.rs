@@ -7,7 +7,7 @@
 use crate::database::models::TagModel;
 use crate::database::repositories::tags::TagsRepository;
 use crate::summary::llm_client::{generate_summary, LLMProvider};
-use crate::summary::processor::clean_llm_markdown_output;
+use crate::summary::processor::clean_llm_markdown_detailed;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -85,7 +85,7 @@ fn outer_span(text: &str, open: char, close: char) -> Option<&str> {
 /// thinking blocks, code fences or prose, and a bare JSON array when the reply has no
 /// object at all. Returns `None` when nothing parses.
 pub fn parse_tag_names(response: &str) -> Option<Vec<String>> {
-    let cleaned = clean_llm_markdown_output(response);
+    let cleaned = clean_llm_markdown_detailed(response).markdown;
 
     // An object under any other shape (e.g. {"not_applicable": [...]}) must not be
     // mistaken for a tag list, so only a reply without one falls back to a bare array
@@ -149,7 +149,8 @@ pub async fn auto_tag_meeting(
         target.app_data_dir,
         target.cancellation_token,
     )
-    .await?;
+    .await?
+    .content;
 
     let names = parse_tag_names(&response)
         .ok_or_else(|| format!("could not read tags from the LLM reply: {}", response.trim()))?;

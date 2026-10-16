@@ -14,7 +14,8 @@ pub type DecoderState = (Array3<f32>, Array3<f32>);
 
 const SUBSAMPLING_FACTOR: usize = 8;
 const WINDOW_SIZE: f32 = 0.01;
-const MAX_TOKENS_PER_STEP: usize = 10;
+const MAX_TOKENS_PER_STEP: usize = 3;
+const TDT_DURATIONS: [usize; 5] = [0, 1, 2, 3, 4];
 
 static DECODE_SPACE_RE: Lazy<Result<Regex, regex::Error>> =
     Lazy::new(|| Regex::new(r"\A\s|\s\B|(\s)\b"));
@@ -40,6 +41,8 @@ pub enum ParakeetError {
     OutputNotFound(String),
     #[error("Failed to get tensor shape for input: {0}")]
     TensorShape(String),
+    #[error("ONNX Runtime unavailable: {0}")]
+    RuntimeUnavailable(String),
 }
 
 pub struct ParakeetModel {
@@ -79,9 +82,10 @@ impl ParakeetModel {
         // with the added cost of copying tensors across the device boundary at every
         // partition edge, which lands slower than running the whole graph on CPU.
         //
-        // The `cuda` feature is what puts the CUDA provider in the linked ONNX Runtime;
-        // whether it can actually be registered on this machine is decided per session
-        // below, since that depends on runtime DLLs the build cannot know about.
+        // The `cuda` feature is what bundles the GPU build of ONNX Runtime (with its CUDA
+        // provider) next to the executable; whether it can actually be registered on this
+        // machine is decided per session below, since that depends on runtime DLLs the
+        // build cannot know about.
         let use_gpu = !quantized && cfg!(feature = "cuda");
         if !quantized && !use_gpu {
             log::info!("Parakeet: build has no CUDA support, running fp32 model on CPU");
@@ -127,6 +131,9 @@ impl ParakeetModel {
         try_quantized: bool,
         use_gpu: bool,
     ) -> Result<(Session, bool), ParakeetError> {
+        crate::ensure_onnx_runtime_available()
+            .map_err(|error| ParakeetError::RuntimeUnavailable(error.to_string()))?;
+
         // Try quantized version first if requested, fallback to regular version
         let model_filename = if try_quantized {
             let quantized_name = format!("{}.int8.onnx", model_name);
@@ -468,17 +475,12 @@ impl ParakeetModel {
                 ))
             })?;
 
-            let vocab_logits = if probs.len() > self.vocab_size {
-                // TDT model - extract only vocabulary logits
-                log::trace!(
-                    "TDT model detected: splitting {} logits into vocab({}) + duration",
-                    probs.len(),
-                    self.vocab_size
-                );
-                &vocab_logits_slice[..self.vocab_size]
+            let is_tdt = probs.len() > self.vocab_size;
+            let (vocab_logits, duration_logits) = if is_tdt {
+                let (v, d) = vocab_logits_slice.split_at(self.vocab_size);
+                (v, Some(d))
             } else {
-                // Regular RNN-T model
-                vocab_logits_slice
+                (vocab_logits_slice, None)
             };
 
             // Get argmax token from vocabulary logits only
@@ -496,10 +498,31 @@ impl ParakeetModel {
                 emitted_tokens += 1;
             }
 
-            // Step logic from Python - simplified since step is always -1
-            if token == self.blank_idx || emitted_tokens == MAX_TOKENS_PER_STEP {
-                t += 1;
-                emitted_tokens = 0;
+            if let Some(duration_logits) = duration_logits {
+                // TDT: advance by the model's predicted duration (frames to skip).
+                let dur_idx = duration_logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0);
+                let mut skip = TDT_DURATIONS.get(dur_idx).copied().unwrap_or(1);
+
+                // Ensure forward progress on blank-with-zero-duration, and cap
+                // same-frame emissions to avoid runaway repetition.
+                if skip == 0 && (token == self.blank_idx || emitted_tokens >= MAX_TOKENS_PER_STEP) {
+                    skip = 1;
+                }
+                if skip > 0 {
+                    t += skip;
+                    emitted_tokens = 0;
+                }
+            } else {
+                // RNN-T greedy: advance one frame on blank or after emission cap.
+                if token == self.blank_idx || emitted_tokens >= MAX_TOKENS_PER_STEP {
+                    t += 1;
+                    emitted_tokens = 0;
+                }
             }
         }
 

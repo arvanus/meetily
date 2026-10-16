@@ -23,6 +23,12 @@ pub fn reset_speech_detected_flag() {
     info!("🔍 SPEECH_DETECTED_EMITTED reset to: {}", SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst));
 }
 
+/// Returns true if the transcript text is non-trivial and should be emitted.
+/// Filters empty/whitespace-only text; no confidence gating is applied.
+fn should_emit_transcript(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TranscriptUpdate {
     pub text: String,
@@ -57,7 +63,8 @@ pub fn start_transcription_task<R: Runtime>(
                 let _ = app.emit("transcription-error", serde_json::json!({
                     "error": e,
                     "userMessage": "Recording failed: Unable to initialize speech recognition. Please check your model settings.",
-                    "actionable": true
+                    "actionable": true,
+                    "phase": "active"
                 }));
                 return;
             }
@@ -189,7 +196,7 @@ pub fn start_transcription_task<R: Runtime>(
                                     // visibly the last words of a meeting. Empty text is still the
                                     // signal for "nothing was said"; the confidence value keeps
                                     // flowing to the UI for display only.
-                                    if !transcript.trim().is_empty() {
+                                    if should_emit_transcript(&transcript) {
                                         // PERFORMANCE: Only log transcription results, not every processing step
                                         info!("✅ Worker {} transcribed: {} (confidence: {}, partial: {})",
                                               worker_id, transcript, confidence_str, is_partial);
@@ -540,7 +547,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         &serde_json::json!({
                             "error": transcription_error.to_string(),
                             "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false
+                            "actionable": false,
+                            "phase": "active"
                         }),
                     );
 
@@ -576,7 +584,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         &serde_json::json!({
                             "error": transcription_error.to_string(),
                             "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false
+                            "actionable": false,
+                            "phase": "active"
                         }),
                     );
 
@@ -624,7 +633,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         &serde_json::json!({
                             "error": e.to_string(),
                             "userMessage": format!("Transcription failed: {}", e),
-                            "actionable": false
+                            "actionable": false,
+                            "phase": "active"
                         }),
                     );
 
@@ -679,5 +689,17 @@ mod tests {
         let mut samples = vec![0.5f32; 1600]; // 100ms
         assert!(!pad_short_chunk(&mut samples));
         assert_eq!(samples.len(), 1600);
+    }
+
+    #[test]
+    fn keeps_short_acknowledgements() {
+        assert!(should_emit_transcript("Yes"));
+        assert!(should_emit_transcript("ok"));
+    }
+
+    #[test]
+    fn drops_empty_and_whitespace_only() {
+        assert!(!should_emit_transcript(""));
+        assert!(!should_emit_transcript("   "));
     }
 }

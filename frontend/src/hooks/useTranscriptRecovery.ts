@@ -18,6 +18,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { indexedDBService, MeetingMetadata, StoredTranscript } from '@/services/indexedDBService';
+import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-preferences';
+import { toast } from 'sonner';
 
 /** An interrupted recording, as reported by the backend. */
 interface IncompleteMeeting {
@@ -212,6 +214,15 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
       }
 
       await indexedDBService.markMeetingSaved(meetingId);
+
+      try {
+        await applyPinnedSummaryLanguageToMeeting(result.meeting_id);
+      } catch (error) {
+        console.warn('Failed to apply pinned summary language to recovered meeting:', error);
+        toast.warning('Could not apply default summary language', {
+          description: 'The recovered meeting was saved, but the default summary language was not applied.',
+        });
+      }
 
       setRecoverableMeetings(prev => prev.filter(m => m.meetingId !== meetingId));
 

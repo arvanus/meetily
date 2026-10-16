@@ -4,7 +4,7 @@
 // Delegates to transcription and recording modules for actual implementation.
 
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,18 +14,18 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
 
 use super::{
+    recording_manager::RecordingStartError,
     parse_audio_device,
     default_input_device,   // Get default microphone
     default_output_device,  // Get default system audio
     AudioDevice,
     DefaultDeviceChange,
     RecordingManager,
-    DeviceEvent,
-    DeviceMonitorType
 };
 use super::devices::DeviceType;
 use super::recording_state::DeviceType as StreamDeviceType;
 use super::stream::AudioStream;
+use super::device_monitor::{DeviceEvent, DeviceMonitorType};
 
 // Import transcription modules
 use super::transcription::{
@@ -42,6 +42,67 @@ pub use super::transcription::TranscriptUpdate;
 
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+
+/// True for the whole `stop_recording` tail (manager taken -> `recording-stopped`
+/// emitted). `IS_RECORDING` must stay true through the tail — the frontend polls
+/// it to keep the stop UI up — so the mic-disconnect fallback checks this flag
+/// too, otherwise a fallback queued before Stop retries against a taken manager
+/// and surfaces a spurious "Microphone fallback failed" toast.
+static IS_RECORDING_STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Recording is live and not being torn down — the only state in which the
+/// mic-disconnect fallback should run or report.
+fn recording_live() -> bool {
+    IS_RECORDING.load(Ordering::SeqCst) && !IS_RECORDING_STOPPING.load(Ordering::SeqCst)
+}
+
+/// Recording is live AND the global manager is still the session `s` belongs to.
+/// Used by the mic-disconnect fallback to refuse acting on a *later* recording
+/// after a Stop/Start swapped the manager out from under an in-flight task.
+///
+/// NOTE: this locks `RECORDING_MANAGER`. Never call it while already holding
+/// that lock (e.g. inside a `RECORDING_MANAGER.lock()` scope) — the std Mutex
+/// is non-reentrant and it would self-deadlock. All current callers invoke it
+/// outside any held lock; keep it that way.
+fn session_live(s: &Arc<super::RecordingState>) -> bool {
+    recording_live()
+        && RECORDING_MANAGER
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(false, |m| Arc::ptr_eq(m.get_state(), s))
+}
+
+/// RAII guard for the stop-tail flag. Sets `IS_RECORDING_STOPPING` true on
+/// construction and clears it on Drop — including during unwind — so a panic
+/// anywhere in the ~320-line stop tail can't leave the flag stuck true and
+/// silently kill the mic-disconnect fallback for every later recording.
+///
+/// This unwind-clears behaviour depends on `panic = "unwind"` (the default).
+/// If a release profile ever sets `panic = "abort"`, Drop won't run on panic
+/// and the stuck-flag failure mode returns — add a start-time reset then.
+struct StoppingGuard;
+impl StoppingGuard {
+    fn new() -> Self {
+        IS_RECORDING_STOPPING.store(true, Ordering::SeqCst);
+        StoppingGuard
+    }
+}
+impl Drop for StoppingGuard {
+    fn drop(&mut self) {
+        IS_RECORDING_STOPPING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Shared start-path finalize. Both start commands MUST call this so a new
+/// start path can't silently ship with a per-session flag left unreset (e.g.
+/// the mic-recovery budget already exhausted).
+fn finalize_recording_start() {
+    info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
+    IS_RECORDING.store(true, Ordering::SeqCst);
+    MIC_FALLBACK_FAILED_ATTEMPTS.store(0, Ordering::SeqCst); // fresh mic-recovery budget per session
+    reset_speech_detected_flag(); // reset speech-detected emit latch for the new session
+}
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
@@ -71,6 +132,10 @@ static CURRENT_RECORDING_MEETING_ID: Mutex<Option<String>> = Mutex::new(None);
 static SHUTDOWN_SEGMENTS: Mutex<Vec<crate::audio::recording_saver::TranscriptSegment>> =
     Mutex::new(Vec::new());
 
+const TRANSCRIPTION_RUNTIME_START_ERROR_CODE: &str =
+    "TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED";
+const TRANSCRIPTION_RUNTIME_USER_MESSAGE: &str = "Speech recognition could not initialize. Restart Meetily. If the problem continues, repair or reinstall the app.";
+
 // ============================================================================
 // PUBLIC TYPES
 // ============================================================================
@@ -85,6 +150,161 @@ pub struct TranscriptionStatus {
     pub chunks_in_queue: usize,
     pub is_processing: bool,
     pub last_activity_ms: u64,
+}
+
+fn map_recording_start_error<R: Runtime>(
+    app: &AppHandle<R>,
+    error: RecordingStartError,
+) -> String {
+    crate::tray::update_tray_menu(app);
+
+    match error {
+        RecordingStartError::TranscriptionRuntime(source) => {
+            error!("Failed to initialize speech recognition: {source:#}");
+            let error = RecordingStartError::TranscriptionRuntime(source);
+            if let Err(emit_error) = app.emit("transcription-error", serde_json::json!({
+                "error": error.to_string(),
+                "userMessage": TRANSCRIPTION_RUNTIME_USER_MESSAGE,
+                "actionable": false,
+                "phase": "startup"
+            })) {
+                error!("Failed to emit transcription runtime startup error: {emit_error}");
+            }
+            TRANSCRIPTION_RUNTIME_START_ERROR_CODE.to_string()
+        }
+        RecordingStartError::Other(error) => format!("Failed to start recording: {error}"),
+    }
+}
+
+// ============================================================================
+// DEVICE RESOLUTION
+// ============================================================================
+
+/// Resolve the microphone to record with: requested device (if it actually
+/// enumerates) → system default → none (system-audio-only recording).
+///
+/// The device picker has no "no microphone" option: choosing "Default
+/// Microphone" sends `None`, so `None` here means "use the system default",
+/// NOT "record without a mic". A specifically-requested mic that isn't in
+/// cpal's current enumeration (a stale saved device, or a Continuity
+/// "iPhone Microphone" that isn't available right now) is downgraded to the
+/// system default — the same `default_input_device()` helper the
+/// mid-recording disconnect path uses — so start never hard-fails with
+/// "Device not found".
+///
+/// Emits at most one event per call:
+/// - `mic-device-switched` — a specific mic was requested but unavailable,
+///   and we fell back to the default (reuses the existing frontend listener).
+/// - `mic-unavailable` — no usable mic at all; recording proceeds with
+///   system audio only. If system audio is also unavailable, start_streams'
+///   own guard reports it.
+/// Resolving `None` to the default is the user's actual choice, so it's silent.
+///
+/// ponytail: sync pre-flight substitution (matches Pro), not catch-and-retry —
+/// stream.rs keeps its hard-fail as the last line of defense. cpal calls
+/// block briefly either way.
+fn resolve_mic_or_default<R: Runtime>(
+    app: &AppHandle<R>,
+    requested_name: Option<&str>,
+) -> Option<Arc<super::AudioDevice>> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let requested_specific = requested_name.is_some();
+
+    if let Some(name) = requested_name {
+        // Accepts both the decorated "Name (input)" the UI stores and the plain name
+        // printed by `--list-devices`
+        let device = device_from_explicit_name(name.to_string(), DeviceType::Input);
+        let exists = cpal::default_host()
+            .input_devices()
+            .map(|mut it| it.any(|d| d.name().map(|n| n == device.name).unwrap_or(false)))
+            .unwrap_or(false);
+        if exists {
+            info!("✅ Using requested microphone: '{}'", device.name);
+            return Some(Arc::new(device));
+        }
+        warn!(
+            "⚠️ Requested mic '{}' not enumerated - falling back to system default",
+            device.name
+        );
+    }
+
+    match default_input_device() {
+        Ok(device) => {
+            info!("✅ Using default microphone: '{}'", device.name);
+            if requested_specific {
+                // Tell the user their selected mic wasn't available and which
+                // mic is actually recording. Reuses the mic-device-switched
+                // listener the disconnect path wires up.
+                let _ = app.emit(
+                    "mic-device-switched",
+                    serde_json::json!({ "device_name": device.name }),
+                );
+            }
+            Some(Arc::new(device))
+        }
+        Err(e) => {
+            warn!("❌ No microphone available: {} — recording system audio only", e);
+            let _ = app.emit("mic-unavailable", serde_json::json!({}));
+            None
+        }
+    }
+}
+
+/// System-audio analog of `resolve_mic_or_default`: `Some(name)` -> that device;
+/// `None` (or an empty name; "Default System Audio" in the UI) -> default output.
+/// Returns `None` only when no output device exists - system audio is optional,
+/// mic-only recording proceeds.
+///
+/// ponytail: no cpal enumeration check (unlike the mic helper) — Linux system
+/// devices are Pulse/ALSA monitor *inputs* tagged Output, so output_devices()
+/// would false-negative them. stream.rs still hard-fails on a missing device.
+fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::AudioDevice>> {
+    if let Some(name) = requested_name.filter(|name| !name.trim().is_empty()) {
+        // Accepts both the decorated "Name (output)" and the plain `--list-devices` name
+        let device = device_from_explicit_name(name.to_string(), DeviceType::Output);
+        info!("✅ Using requested system audio: '{}'", device.name);
+        return Some(Arc::new(device));
+    }
+
+    match default_output_device() {
+        Ok(device) => {
+            info!("✅ Using default system audio: '{}'", device.name);
+            Some(Arc::new(device))
+        }
+        Err(e) => {
+            warn!("⚠️ No system audio available: {} — recording will continue with microphone only", e);
+            None
+        }
+    }
+}
+
+/// Wake idle audio hardware before checking microphone callbacks, and finish
+/// validation before creating any recording resources.
+#[cfg(target_os = "macos")]
+async fn prepare_audio_for_recording(
+    system_device: Option<&super::AudioDevice>,
+) -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let wake_name = system_device
+        .map(|s| s.name.clone())
+        .or_else(|| {
+            cpal::default_host()
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+        });
+    if let Some(name) = wake_name {
+        if let Err(e) = super::recording_manager::wake_audio_connection(&name).await {
+            warn!("[AUDIO_WAKE] Wake failed: {} — proceeding anyway", e);
+        }
+    }
+
+    if let Err(e) = super::devices::verify_microphone_access().await {
+        error!("Microphone access verification failed: {}", e);
+        return Err(format!("Microphone access required: {}", e));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -288,6 +508,16 @@ async fn migrate_to_default_device(change: &DefaultDeviceChange) -> Result<(), S
     }
     .ok_or_else(|| "recording manager is no longer active".to_string())?;
 
+    // The mic-disconnect fallback may already have moved capture to this same device
+    let current = match change.device_type {
+        DeviceMonitorType::Microphone => state.get_microphone_device(),
+        DeviceMonitorType::SystemAudio => state.get_system_device(),
+    };
+    if current.map_or(false, |device| device.name == change.new_name) {
+        debug!("'{}' is already the active device, nothing to migrate", change.new_name);
+        return Ok(());
+    }
+
     let (device, stream_role) = match change.device_type {
         DeviceMonitorType::Microphone => (
             AudioDevice::new(change.new_name.clone(), DeviceType::Input),
@@ -423,109 +653,28 @@ fn device_from_explicit_name(name: String, device_type: DeviceType) -> AudioDevi
     }
 }
 
-/// Resolve the microphone: explicit device → stored preference → system default.
+/// Resolve both devices for a start path. Each name is the explicit device or, when
+/// none was given, the stored preference; `None` means the system default.
 ///
-/// A microphone is mandatory, so an unresolvable one is an error.
-fn resolve_microphone_device(
-    mic_override: Option<String>,
-    preferred_mic_name: Option<String>,
-) -> Result<Arc<AudioDevice>, String> {
-    if let Some(name) = mic_override {
-        let device = device_from_explicit_name(name, DeviceType::Input);
-        info!("🎤 Using the microphone requested explicitly: '{}'", device.name);
-        return Ok(Arc::new(device));
-    }
+/// On macOS the audio hardware is woken and microphone access verified before the
+/// microphone is resolved, so a Bluetooth link that was asleep enumerates properly.
+async fn resolve_recording_devices<R: Runtime>(
+    app: &AppHandle<R>,
+    microphone_name: Option<String>,
+    system_name: Option<String>,
+) -> Result<(Option<Arc<AudioDevice>>, Option<Arc<AudioDevice>>), String> {
+    #[cfg(not(target_os = "macos"))]
+    let microphone = resolve_mic_or_default(app, microphone_name.as_deref());
 
-    let Some(pref_name) = preferred_mic_name else {
-        info!("🎤 No microphone preference set, using system default");
-        return match default_input_device() {
-            Ok(device) => {
-                info!("✅ Using default microphone: '{}'", device.name);
-                Ok(Arc::new(device))
-            }
-            Err(e) => {
-                error!("❌ No default microphone available");
-                Err(format!("No microphone device available: {}", e))
-            }
-        };
-    };
+    let system = resolve_system_or_default(system_name.as_deref());
 
-    info!("🎤 Attempting to use preferred microphone: '{}'", pref_name);
-    match parse_audio_device(&pref_name) {
-        Ok(device) => {
-            info!("✅ Using preferred microphone: '{}'", device.name);
-            Ok(Arc::new(device))
-        }
-        Err(e) => {
-            warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
-            warn!("   Falling back to system default microphone...");
-            match default_input_device() {
-                Ok(device) => {
-                    info!("✅ Using default microphone: '{}'", device.name);
-                    Ok(Arc::new(device))
-                }
-                Err(default_err) => {
-                    error!("❌ No microphone available (preferred and default both failed)");
-                    Err(format!(
-                        "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
-                        pref_name, default_err
-                    ))
-                }
-            }
-        }
-    }
-}
+    #[cfg(target_os = "macos")]
+    prepare_audio_for_recording(system.as_deref()).await?;
 
-/// Resolve system audio: explicit device → stored preference → system default.
-///
-/// System audio is optional: `None` means the recording continues microphone-only.
-fn resolve_system_device(
-    system_override: Option<String>,
-    preferred_system_name: Option<String>,
-) -> Option<Arc<AudioDevice>> {
-    if let Some(name) = system_override {
-        let device = device_from_explicit_name(name, DeviceType::Output);
-        info!("🔊 Using the system audio device requested explicitly: '{}'", device.name);
-        return Some(Arc::new(device));
-    }
+    #[cfg(target_os = "macos")]
+    let microphone = resolve_mic_or_default(app, microphone_name.as_deref());
 
-    let Some(pref_name) = preferred_system_name else {
-        info!("🔊 No system audio preference set, using system default");
-        return match default_output_device() {
-            Ok(device) => {
-                info!("✅ Using default system audio: '{}'", device.name);
-                Some(Arc::new(device))
-            }
-            Err(e) => {
-                warn!("⚠️ No default system audio available: {}", e);
-                warn!("   Recording will continue with microphone only");
-                None
-            }
-        };
-    };
-
-    info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
-    match parse_audio_device(&pref_name) {
-        Ok(device) => {
-            info!("✅ Using preferred system audio: '{}'", device.name);
-            Some(Arc::new(device))
-        }
-        Err(e) => {
-            warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
-            warn!("   Falling back to system default...");
-            match default_output_device() {
-                Ok(device) => {
-                    info!("✅ Using default system audio: '{}'", device.name);
-                    Some(Arc::new(device))
-                }
-                Err(default_err) => {
-                    warn!("⚠️ No system audio available (preferred and default both failed): {}", default_err);
-                    warn!("   Recording will continue with microphone only");
-                    None
-                }
-            }
-        }
-    }
+    Ok((microphone, system))
 }
 
 /// Start recording with default devices
@@ -549,11 +698,20 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         meeting_name, mic_override, system_override
     );
 
+    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("🔍 IS_RECORDING state check: {}", current_recording_state);
     if current_recording_state {
         return Err("Recording already in progress".to_string());
+    }
+
+    if let Err(error) = crate::ensure_onnx_runtime_available() {
+        return Err(map_recording_start_error(
+            &app,
+            RecordingStartError::TranscriptionRuntime(error),
+        ));
     }
 
     // Validate that transcription models are available before starting recording
@@ -565,19 +723,19 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         // (download progress is already shown in top-right toast)
         let _ = app.emit("transcription-error", serde_json::json!({
             "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
-            "actionable": false
+            "userMessage": format!("Recording cannot start: {}", validation_error),
+            "actionable": false,
+            "phase": "startup"
         }));
 
         return Err(validation_error);
     }
     info!("✅ Transcription model validation passed");
 
-    // Async-first approach - no more blocking operations!
-    info!("🚀 Starting async recording initialization");
-
-    // Create new recording manager
-    let mut manager = RecordingManager::new();
+    // Notify frontend that startup has begun (surfaces STARTING state)
+    app.emit("recording-starting", serde_json::json!({
+        "message": "Recording initialization started"
+    })).map_err(|e| e.to_string())?;
 
     // Load recording preferences to get auto_save, device preferences, AND recording mode
     let (auto_save, preferred_mic_name, preferred_system_name, recording_mode) =
@@ -600,9 +758,20 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let follow_default_mic = mic_override.is_none() && preferred_mic_name.is_none();
     let follow_default_system = system_override.is_none() && preferred_system_name.is_none();
 
-    // Explicit → Preference → Default (microphone is mandatory, system audio is not)
-    let microphone_device = Some(resolve_microphone_device(mic_override, preferred_mic_name)?);
-    let system_device = resolve_system_device(system_override, preferred_system_name);
+    // Explicit → Preference → Default. A missing microphone is not fatal: the
+    // recording proceeds with system audio only (see resolve_mic_or_default).
+    let (microphone_device, system_device) = resolve_recording_devices(
+        &app,
+        mic_override.or(preferred_mic_name),
+        system_override.or(preferred_system_name),
+    )
+    .await?;
+
+    // Async-first approach - no more blocking operations!
+    info!("🚀 Starting async recording initialization");
+
+    // Create new recording manager only after startup validation succeeds
+    let mut manager = RecordingManager::new();
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -632,7 +801,12 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let transcription_receiver = manager
         .start_recording(microphone_device, system_device, auto_save, recording_mode)
         .await
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
+        .map_err(|error| map_recording_start_error(&app, error))?;
+
+    // Take the device event receiver BEFORE storing manager globally.
+    // A background task will process device events (hot-swap) without frontend polling.
+    let device_event_receiver = manager.take_device_event_receiver();
+    let session = manager.get_state().clone();
 
     // Get recording state before storing manager (for audio level emission)
     let recording_state_arc = manager.recording_state();
@@ -646,16 +820,21 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         *global_manager = Some(manager);
     }
 
+    // Spawn background device event processor (mic-disconnect fallback).
+    if let Some(receiver) = device_event_receiver {
+        spawn_device_event_processor(app.clone(), receiver, session);
+    }
+
     // Spawn only after the manager is reachable globally - the task locks it to swap streams
     if let Some(receiver) = default_change_receiver {
         spawn_default_device_migration(app.clone(), receiver);
     }
 
-    // Set recording flag and reset speech detection flag
-    info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
-    IS_RECORDING.store(true, Ordering::SeqCst);
-    reset_speech_detected_flag(); // Reset for new recording session
+    // Flip recording live + reset per-session flags (speech-detected latch,
+    // mic-recovery budget). Shared with the other start paths - see helper.
+    finalize_recording_start();
     let _ = drain_shutdown_segments(); // Drop leftovers from a previous session
+    drop(engine_lifecycle_guard);
 
     // Create the meeting row now, not on stop, so a process that dies mid-recording
     // still leaves something discoverable. Best-effort: never blocks the recording.
@@ -780,6 +959,13 @@ pub async fn start_recording_only<R: Runtime>(
 
     // DIFF vs normal path: NO transcription-model validation here — record-only
     // never loads AI, so a missing/downloading model must not block recording.
+    // The ONNX Runtime check still applies: the pipeline's VAD runs on it.
+    if let Err(error) = crate::ensure_onnx_runtime_available() {
+        return Err(map_recording_start_error(
+            &app,
+            RecordingStartError::TranscriptionRuntime(error),
+        ));
+    }
 
     info!("🚀 Starting async record-only initialization (no AI)");
 
@@ -811,8 +997,12 @@ pub async fn start_recording_only<R: Runtime>(
     let follow_default_system = system_override.is_none() && preferred_system_name.is_none();
 
     // Same resolution as the normal path: Explicit → Preference → Default
-    let microphone_device = Some(resolve_microphone_device(mic_override, preferred_mic_name)?);
-    let system_device = resolve_system_device(system_override, preferred_system_name);
+    let (microphone_device, system_device) = resolve_recording_devices(
+        &app,
+        mic_override.or(preferred_mic_name),
+        system_override.or(preferred_system_name),
+    )
+    .await?;
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -850,6 +1040,10 @@ pub async fn start_recording_only<R: Runtime>(
         while receiver.recv().await.is_some() {}
     });
 
+    // Take the device event receiver BEFORE storing manager globally (mic-disconnect fallback)
+    let device_event_receiver = manager.take_device_event_receiver();
+    let session = manager.get_state().clone();
+
     // Get recording state before storing manager (for audio level emission)
     let recording_state_arc = manager.recording_state();
 
@@ -862,15 +1056,17 @@ pub async fn start_recording_only<R: Runtime>(
         *global_manager = Some(manager);
     }
 
+    if let Some(receiver) = device_event_receiver {
+        spawn_device_event_processor(app.clone(), receiver, session);
+    }
+
     // Spawn only after the manager is reachable globally - the task locks it to swap streams
     if let Some(receiver) = default_change_receiver {
         spawn_default_device_migration(app.clone(), receiver);
     }
 
-    // Set recording flag and reset speech detection flag
-    info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
-    IS_RECORDING.store(true, Ordering::SeqCst);
-    reset_speech_detected_flag(); // Reset for new recording session
+    // Flip recording live + reset per-session flags (shared with the other start paths)
+    finalize_recording_start();
     let _ = drain_shutdown_segments(); // Drop leftovers from a previous session
 
     // Create the meeting row now, not on stop, so a process that dies mid-recording
@@ -951,11 +1147,20 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         mic_device_name, system_device_name, meeting_name
     );
 
+    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("🔍 IS_RECORDING state check: {}", current_recording_state);
     if current_recording_state {
         return Err("Recording already in progress".to_string());
+    }
+
+    if let Err(error) = crate::ensure_onnx_runtime_available() {
+        return Err(map_recording_start_error(
+            &app,
+            RecordingStartError::TranscriptionRuntime(error),
+        ));
     }
 
     // Validate that transcription models are available before starting recording
@@ -967,13 +1172,19 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         // (download progress is already shown in top-right toast)
         let _ = app.emit("transcription-error", serde_json::json!({
             "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
-            "actionable": false
+            "userMessage": format!("Recording cannot start: {}", validation_error),
+            "actionable": false,
+            "phase": "startup"
         }));
 
         return Err(validation_error);
     }
     info!("✅ Transcription model validation passed");
+
+    // Notify frontend that startup has begun (surfaces STARTING state)
+    app.emit("recording-starting", serde_json::json!({
+        "message": "Recording initialization started"
+    })).map_err(|e| e.to_string())?;
 
     // Async-first approach for custom devices - no more blocking operations!
     info!("🚀 Starting async recording initialization with custom devices");
@@ -1000,18 +1211,23 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let follow_default_mic = mic_device_name.is_none() && preferred_mic_name.is_none();
     let follow_default_system = system_device_name.is_none() && preferred_system_name.is_none();
 
-    let microphone = resolve_microphone_device(mic_device_name, preferred_mic_name)?;
-    let system_device = resolve_system_device(system_device_name, preferred_system_name);
+    let (mic_device, system_device) = resolve_recording_devices(
+        &app,
+        mic_device_name.or(preferred_mic_name),
+        system_device_name.or(preferred_system_name),
+    )
+    .await?;
 
     // Labels for the "recording-started" event: what was actually resolved, which is
     // more useful than the requested name now that None falls back
-    let started_mic_label = microphone.name.clone();
+    let started_mic_label = mic_device
+        .as_ref()
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| "No Microphone".to_string());
     let started_system_label = system_device
         .as_ref()
         .map(|d| d.name.clone())
         .unwrap_or_else(|| "No System Audio".to_string());
-
-    let mic_device = Some(microphone);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -1040,7 +1256,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save, super::recording_preferences::RecordingMode::Mono)
         .await
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
+        .map_err(|error| map_recording_start_error(&app, error))?;
+
+    // Take the device event receiver BEFORE storing manager globally.
+    // A background task will process device events (hot-swap) without frontend polling.
+    let device_event_receiver = manager.take_device_event_receiver();
+    let session = manager.get_state().clone();
 
     // Taken before the manager moves into the global; Some only when a role follows the default
     let default_change_receiver = manager.take_default_change_receiver();
@@ -1051,16 +1272,21 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         *global_manager = Some(manager);
     }
 
+    // Spawn background device event processor (mic-disconnect fallback).
+    if let Some(receiver) = device_event_receiver {
+        spawn_device_event_processor(app.clone(), receiver, session);
+    }
+
     // Spawn only after the manager is reachable globally - the task locks it to swap streams
     if let Some(receiver) = default_change_receiver {
         spawn_default_device_migration(app.clone(), receiver);
     }
 
-    // Set recording flag and reset speech detection flag
-    info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
-    IS_RECORDING.store(true, Ordering::SeqCst);
-    reset_speech_detected_flag(); // Reset for new recording session
+    // Flip recording live + reset per-session flags (speech-detected latch,
+    // mic-recovery budget). Shared with the other start paths - see helper.
+    finalize_recording_start();
     let _ = drain_shutdown_segments(); // Drop leftovers from a previous session
+    drop(engine_lifecycle_guard);
 
     // Create the meeting row now, not on stop, so a process that dies mid-recording
     // still leaves something discoverable. Best-effort: never blocks the recording.
@@ -1150,6 +1376,13 @@ pub async fn stop_recording<R: Runtime>(
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         global_manager.take()
     };
+
+    // Mark the stop tail as in progress so a mic-disconnect fallback that was
+    // queued before Stop short-circuits instead of retrying against the taken
+    // manager. IS_RECORDING itself stays true until the tail completes — the
+    // frontend polls it to keep the stop UI up. RAII so a panic in the tail
+    // below can't leave the flag stuck true.
+    let _stopping_guard = StoppingGuard::new();
 
     let stop_result = if let Some(mut manager) = manager_for_cleanup {
         // Use FORCE FLUSH to immediately process all accumulated audio - eliminates 30s delay!
@@ -1539,6 +1772,7 @@ pub async fn stop_recording<R: Runtime>(
     // Set recording flag to false (this also stops the audio level emission task)
     info!("🔍 Setting IS_RECORDING to false");
     IS_RECORDING.store(false, Ordering::SeqCst);
+    // IS_RECORDING_STOPPING is cleared by _stopping_guard on scope exit.
 
     // Clean up audio level emission task
     {
@@ -1766,102 +2000,6 @@ pub async fn get_recording_meeting_name() -> Result<Option<String>, String> {
 // DEVICE MONITORING COMMANDS (AirPods/Bluetooth disconnect/reconnect support)
 // ============================================================================
 
-/// Response structure for device events
-#[derive(Debug, Serialize, Clone)]
-#[serde(tag = "type")]
-pub enum DeviceEventResponse {
-    DeviceDisconnected {
-        device_name: String,
-        device_type: String,
-    },
-    DeviceReconnected {
-        device_name: String,
-        device_type: String,
-    },
-    DeviceListChanged,
-}
-
-impl From<DeviceEvent> for DeviceEventResponse {
-    fn from(event: DeviceEvent) -> Self {
-        match event {
-            DeviceEvent::DeviceDisconnected { device_name, device_type } => {
-                DeviceEventResponse::DeviceDisconnected {
-                    device_name,
-                    device_type: format!("{:?}", device_type),
-                }
-            }
-            DeviceEvent::DeviceReconnected { device_name, device_type } => {
-                DeviceEventResponse::DeviceReconnected {
-                    device_name,
-                    device_type: format!("{:?}", device_type),
-                }
-            }
-            DeviceEvent::DeviceListChanged => DeviceEventResponse::DeviceListChanged,
-        }
-    }
-}
-
-/// Reconnection status information
-#[derive(Debug, Serialize, Clone)]
-pub struct ReconnectionStatus {
-    pub is_reconnecting: bool,
-    pub disconnected_device: Option<DisconnectedDeviceInfo>,
-}
-
-/// Information about a disconnected device
-#[derive(Debug, Serialize, Clone)]
-pub struct DisconnectedDeviceInfo {
-    pub name: String,
-    pub device_type: String,
-}
-
-/// Poll for audio device events (disconnect/reconnect)
-/// Should be called periodically (every 1-2 seconds) by frontend during recording
-#[tauri::command]
-pub async fn poll_audio_device_events() -> Result<Option<DeviceEventResponse>, String> {
-    let mut manager_guard = RECORDING_MANAGER.lock().unwrap();
-
-    if let Some(manager) = manager_guard.as_mut() {
-        if let Some(event) = manager.poll_device_events() {
-            info!("📱 Device event polled: {:?}", event);
-            Ok(Some(event.into()))
-        } else {
-            Ok(None)
-        }
-    } else {
-        // Not recording, no events
-        Ok(None)
-    }
-}
-
-/// Get current reconnection status
-/// Returns whether the system is attempting to reconnect and which device
-#[tauri::command]
-pub async fn get_reconnection_status() -> Result<ReconnectionStatus, String> {
-    let manager_guard = RECORDING_MANAGER.lock().unwrap();
-
-    if let Some(manager) = manager_guard.as_ref() {
-        let state = manager.get_state();
-        let disconnected_device = state.get_disconnected_device().map(|(device, device_type)| {
-            DisconnectedDeviceInfo {
-                name: device.name.clone(),
-                device_type: format!("{:?}", device_type),
-            }
-        });
-
-        Ok(ReconnectionStatus {
-            is_reconnecting: manager.is_reconnecting(),
-            disconnected_device,
-        })
-    } else {
-        // Not recording, no reconnection in progress
-        Ok(ReconnectionStatus {
-            is_reconnecting: false,
-            disconnected_device: None,
-        })
-    }
-}
-
 /// Get information about the active audio output device
 /// Used to warn users about Bluetooth playback issues
 #[tauri::command]
@@ -1871,54 +2009,428 @@ pub async fn get_active_audio_output() -> Result<super::playback_monitor::AudioO
         .map_err(|e| format!("Failed to get audio output info: {}", e))
 }
 
-/// Manually trigger device reconnection attempt
-/// Useful for UI "Retry" button
-#[tauri::command]
-pub async fn attempt_device_reconnect(
-    device_name: String,
-    device_type: String,
-) -> Result<bool, String> {
-    // Parse device type first
-    let monitor_type = match device_type.as_str() {
-        "Microphone" => DeviceMonitorType::Microphone,
-        "SystemAudio" => DeviceMonitorType::SystemAudio,
-        _ => return Err(format!("Invalid device type: {}", device_type)),
-    };
 
-    // Check if recording is active
-    {
-        let manager_guard = RECORDING_MANAGER.lock().unwrap();
-        if manager_guard.is_none() {
-            return Err("Recording not active".to_string());
-        }
-    } // Release lock
+// ============================================================================
+// MIC HOT-SWAP (disconnect recovery)
+// ============================================================================
 
-    // Spawn blocking task to handle the async reconnection
-    let result = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(async {
-            let mut manager_guard = RECORDING_MANAGER.lock().unwrap();
-            if let Some(manager) = manager_guard.as_mut() {
-                manager.attempt_device_reconnect(&device_name, monitor_type).await
-            } else {
-                Err(anyhow::anyhow!("Recording not active"))
-            }
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
+// Guard against concurrent mic hot-swap tasks. Only used by the disconnect
+// fallback path (trigger_mic_fallback_to_default) — the "chase the new
+// default" auto-swap has been removed.
+static MIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    match result {
-        Ok(success) => {
-            if success {
-                info!("✅ Manual reconnection successful");
-            } else {
-                warn!("❌ Manual reconnection failed - device not available");
-            }
-            Ok(success)
+// Bounded retry budget for the disconnect fallback (P1 #2). Counts COMPLETED
+// failed attempts; MIC_SWAP_IN_PROGRESS still prevents overlapping swaps.
+static MIC_FALLBACK_FAILED_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const MAX_MIC_FALLBACK_ATTEMPTS: u32 = 3;
+
+/// Perform mic hot-swap using phased locking — never holds RECORDING_MANAGER during I/O
+/// except the brief mic-stream stop in Phase 1.
+/// If CPAL hangs during stream creation, only this task blocks; stop flow stays unblocked.
+async fn perform_mic_hot_swap_task<R: Runtime>(
+    new_device_name: String,
+    session: &Arc<super::RecordingState>,
+    app: AppHandle<R>,
+) -> Result<(), String> {
+    info!("[HOT_SWAP] Starting mic hot-swap to '{}'", new_device_name);
+
+    match do_mic_swap(&new_device_name, session).await {
+        Ok(()) => {
+            info!("[HOT_SWAP] Mic switched to '{}'", new_device_name);
+            let _ = app.emit("mic-device-switched", serde_json::json!({
+                "device_name": new_device_name
+            }));
+            Ok(())
         }
         Err(e) => {
-            error!("Manual reconnection error: {}", e);
-            Err(e.to_string())
+            if !session_live(session) {
+                return Err(e);
+            }
+            warn!("[HOT_SWAP] First attempt failed: {} — retrying in 500ms", e);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            match do_mic_swap(&new_device_name, session).await {
+                Ok(()) => {
+                    info!("[HOT_SWAP] Mic switched to '{}' on retry", new_device_name);
+                    let _ = app.emit("mic-device-switched", serde_json::json!({
+                        "device_name": new_device_name
+                    }));
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("[HOT_SWAP] Mic swap failed after retry: {}", e);
+                    if session_live(session) {
+                        let _ = app.emit("mic-swap-failed", serde_json::json!({
+                            "error": e,
+                            "device_name": new_device_name
+                        }));
+                    }
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// Phased mic swap — lock is never held during async I/O.
+async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) -> Result<(), String> {
+    // Phase 1: Lock briefly — verify identity, take old stream OUT (no teardown under lock)
+    let old_mic = {
+        let mut guard = RECORDING_MANAGER.lock().unwrap();
+        let manager = guard.as_mut().ok_or_else(|| "Recording manager not available".to_string())?;
+        if !manager.is_recording() {
+            return Err("Recording stopped — aborting mic hot-swap".to_string());
+        }
+        if !Arc::ptr_eq(manager.get_state(), session) {
+            return Err("Session changed before hot-swap — aborting".to_string());
+        }
+        manager.take_mic_stream_for_swap()
+    }; // lock released
+
+    // Tear down the dead mic OUTSIDE the lock — cpal stop()/drop on a
+    // disconnected BT device can stall on the CoreAudio HAL lock; doing it
+    // under RECORDING_MANAGER would freeze stop_recording (deep-review #2).
+    // Non-fatal: the replacement stream is created next regardless, so a
+    // teardown error/stall on the already-dead device must not abort the swap.
+    if let Some(s) = old_mic {
+        if let Err(e) = s.stop() {
+            warn!("[HOT_SWAP] Failed to stop old mic stream (proceeding): {}", e);
+        }
+    }
+
+    // Phase 2: Async I/O WITHOUT lock — may be slow, that's OK
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Build the AudioDevice directly from the name — the caller
+    // (trigger_mic_fallback_to_default) already resolved it via
+    // default_input_device(). Skipping list_audio_devices() here avoids a
+    // full cpal enumeration on the exact BT-transition hot path where it's
+    // known to hang 100+ s (see H2 in PR-175 review). The real device
+    // validation happens inside AudioStream::create → get_device_and_config
+    // which does a targeted host.input_devices() lookup by name.
+    let device_arc = std::sync::Arc::new(super::AudioDevice::new(
+        device_name.to_string(),
+        super::DeviceType::Input,
+    ));
+
+    info!("[HOT_SWAP] Creating new mic stream for '{}' (lock released)", device_name);
+    let new_stream = super::stream::AudioStream::create(
+        device_arc.clone(),
+        session.clone(),
+        super::recording_state::DeviceType::Microphone,
+        None,
+    ).await.map_err(|e| format!("Failed to create mic stream: {}", e))?;
+
+    // Resolve the current default output OUTSIDE the lock — a CoreAudio stall here
+    // must not block stop_recording (which needs RECORDING_MANAGER). (P1 #1)
+    let system_name = default_output_device().ok().map(|d| d.name);
+
+    // Phase 3: Lock briefly — install ONLY if still the same session
+    {
+        let mut guard = RECORDING_MANAGER.lock().unwrap();
+        match guard.as_mut() {
+            Some(manager) if Arc::ptr_eq(manager.get_state(), session) => {
+                manager.set_mic_stream_after_swap(new_stream, device_arc, system_name);
+                info!("[HOT_SWAP] Mic hot-swap to '{}' completed", device_name);
+            }
+            Some(_) => {
+                return Err("Session changed during hot-swap — discarding stale mic stream".to_string());
+            }
+            None => {
+                return Err("Recording manager gone during hot-swap".to_string());
+            }
+        }
+    } // lock released
+
+    Ok(())
+}
+
+/// Background processor for device monitor events during a recording session.
+///
+/// The ONLY mid-recording mic switch that is allowed is the fallback from a
+/// dead device to the system default, triggered by the device monitor's
+/// DeviceDisconnected event. Any other device event is explicitly ignored —
+/// recording stays on whatever device was picked at start time until the
+/// meeting ends.
+///
+/// Rationale: auto-swapping to a freshly-connected BT device during recording
+/// triggers a reliable hang inside cpal's stream creation on macOS. Locking
+/// the device at start eliminates that hang and also makes the recording
+/// session predictable.
+///
+/// The task stops automatically when the receiver is dropped (recording
+/// ends / monitor stops).
+fn spawn_device_event_processor<R: Runtime>(
+    app: AppHandle<R>,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<DeviceEvent>,
+    session: Arc<super::RecordingState>,
+) {
+    tokio::spawn(async move {
+        info!("[DEVICE_EVENTS] Background event processor started");
+
+        while let Some(event) = receiver.recv().await {
+            // Skip if recording has stopped
+            if !recording_live() {
+                info!("[DEVICE_EVENTS] Recording stopped — ignoring event: {:?}", event);
+                continue;
+            }
+
+            match event {
+                DeviceEvent::DeviceDisconnected { ref device_name, ref device_type } => {
+                    info!("[DEVICE_EVENTS] Device disconnected: '{}' ({:?})", device_name, device_type);
+                    // The only automatic mid-recording mic change allowed:
+                    // when the active microphone dies, fall back to the
+                    // system default input. Triggered after the device
+                    // monitor's polling threshold fires.
+                    if matches!(device_type, DeviceMonitorType::Microphone) {
+                        let name = device_name.clone();
+                        let app_clone = app.clone();
+                        let session = session.clone();
+                        tokio::spawn(async move {
+                            trigger_mic_fallback_to_default(app_clone, name, session).await;
+                        });
+                    }
+                }
+                DeviceEvent::DeviceReconnected { ref device_name, ref device_type } => {
+                    // Per product decision: once we have fallen back to the
+                    // built-in mic we stay there for the rest of the meeting.
+                    // This is intentional — just log and do nothing.
+                    info!("[DEVICE_EVENTS] Device reconnected: '{}' ({:?}) — staying on current mic (fallback is sticky)", device_name, device_type);
+                }
+                DeviceEvent::DeviceListChanged => {
+                    debug!("[DEVICE_EVENTS] Device list changed");
+                }
+            }
+        }
+        info!("[DEVICE_EVENTS] Background event processor stopped (channel closed)");
+    });
+}
+
+/// Disconnect fallback: swap the active mic to the system default input
+/// device. Triggered from the background device event processor after the
+/// device monitor's polling threshold (3 × 2s) fires `DeviceDisconnected`
+/// for the active microphone.
+///
+/// `disconnected_name` is the device that just died. We keep it to detect
+/// the edge case where macOS hasn't yet updated the system default input
+/// away from the dead device — we wait and retry in that case rather than
+/// swapping back to the same broken device.
+///
+/// This function takes the MIC_SWAP_IN_PROGRESS guard itself; the caller
+/// must NOT already hold it. If a swap is somehow already running this
+/// returns immediately.
+async fn trigger_mic_fallback_to_default<R: Runtime>(
+    app: AppHandle<R>,
+    disconnected_name: String,
+    session: Arc<super::RecordingState>,
+) {
+    if !session_live(&session) {
+        info!(
+            "[MIC_FALLBACK] Not recording — skipping fallback for '{}'",
+            disconnected_name
+        );
+        return;
+    }
+
+    if MIC_FALLBACK_FAILED_ATTEMPTS.load(Ordering::SeqCst) >= MAX_MIC_FALLBACK_ATTEMPTS {
+        warn!(
+            "[MIC_FALLBACK] {} failed attempts reached — giving up on '{}' (terminal event already announced)",
+            MAX_MIC_FALLBACK_ATTEMPTS, disconnected_name
+        );
+        return;
+    }
+
+    if MIC_SWAP_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        info!(
+            "[MIC_FALLBACK] Swap already in progress — skipping fallback for '{}'",
+            disconnected_name
+        );
+        return;
+    }
+
+    // Guard that clears MIC_SWAP_IN_PROGRESS on any return path below so a
+    // panic or early return can't leave the flag stuck.
+    struct SwapGuard;
+    impl Drop for SwapGuard {
+        fn drop(&mut self) {
+            MIC_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = SwapGuard;
+
+    info!(
+        "[MIC_FALLBACK] Starting fallback from disconnected device '{}'",
+        disconnected_name
+    );
+
+    // Let macOS finish swapping the system default input away from the dead
+    // device. 150ms is enough in practice for the built-in mic to become the
+    // default when an explicitly-selected BT device disconnects.
+    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+    // A Stop-A/Start-B during the sleep swapped our session out. Bail silently —
+    // emitting or spending the recovery budget here would fire against B with
+    // A's device. Covers the default_input_device() error branch below.
+    if !session_live(&session) {
+        info!("[MIC_FALLBACK] Session no longer live after wait — aborting fallback for '{}'", disconnected_name);
+        return;
+    }
+
+    // Query the current system default input. If it still reports the
+    // disconnected device, back off once more and re-query — this handles
+    // the edge case where the OS hasn't propagated the change yet.
+    let fallback_name = match default_input_device() {
+        Ok(dev) => dev.name,
+        Err(e) => {
+            error!("[MIC_FALLBACK] Failed to query default input device: {}", e);
+            let _ = app.emit(
+                "mic-swap-failed",
+                serde_json::json!({
+                    "error": format!("Failed to query default input: {}", e),
+                    "device_name": disconnected_name,
+                }),
+            );
+            let n = MIC_FALLBACK_FAILED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == MAX_MIC_FALLBACK_ATTEMPTS {
+                let _ = app.emit(
+                    "mic-recovery-exhausted",
+                    serde_json::json!({ "device_name": disconnected_name }),
+                );
+            }
+            return;
+        }
+    };
+
+    let fallback_name = if fallback_name == disconnected_name {
+        warn!(
+            "[MIC_FALLBACK] Default input still reports disconnected device '{}' — retrying after 300ms",
+            disconnected_name
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        if !session_live(&session) {
+            info!("[MIC_FALLBACK] Session no longer live after retry wait — aborting fallback for '{}'", disconnected_name);
+            return;
+        }
+        match default_input_device() {
+            Ok(dev) if dev.name != disconnected_name => dev.name,
+            Ok(dev) => {
+                error!(
+                    "[MIC_FALLBACK] Default input still '{}' after retry — aborting fallback",
+                    dev.name
+                );
+                let _ = app.emit(
+                    "mic-swap-failed",
+                    serde_json::json!({
+                        "error": "System default input still reports disconnected device after retry",
+                        "device_name": disconnected_name,
+                    }),
+                );
+                let n = MIC_FALLBACK_FAILED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == MAX_MIC_FALLBACK_ATTEMPTS {
+                    let _ = app.emit(
+                        "mic-recovery-exhausted",
+                        serde_json::json!({ "device_name": disconnected_name }),
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                error!("[MIC_FALLBACK] Failed to re-query default input device: {}", e);
+                let _ = app.emit(
+                    "mic-swap-failed",
+                    serde_json::json!({
+                        "error": format!("Failed to re-query default input: {}", e),
+                        "device_name": disconnected_name,
+                    }),
+                );
+                let n = MIC_FALLBACK_FAILED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == MAX_MIC_FALLBACK_ATTEMPTS {
+                    let _ = app.emit(
+                        "mic-recovery-exhausted",
+                        serde_json::json!({ "device_name": disconnected_name }),
+                    );
+                }
+                return;
+            }
+        }
+    } else {
+        fallback_name
+    };
+
+    info!(
+        "[MIC_FALLBACK] Falling back '{}' → '{}'",
+        disconnected_name, fallback_name
+    );
+
+    // macOS Core Audio pre-wake for the hot-swap path — before we call the
+    // rebuild path (which internally calls `AudioDeviceStart` on the new
+    // mic), play 150ms of digital silence through the current system
+    // output device to force the Core Audio hardware unit out of its idle
+    // power state. Without this, `AudioDeviceStart` can return `noErr` but
+    // the IO proc will not fire for 10-30 seconds until some other audio
+    // nudges the hardware awake — the "backend idle until you play YouTube"
+    // symptom from earlier testing.
+    //
+    // `wake_audio_connection_for_swap` has a built-in fallback: if the
+    // current system device name doesn't enumerate (e.g. the BT output just
+    // disappeared), it plays through `default_output_device()` instead,
+    // which on macOS will now be the built-in speakers — exactly the
+    // hardware unit we want to wake for the fallback mic.
+    //
+    // Non-fatal: on error we log and proceed to the swap anyway. A failed
+    // wake is strictly better than no wake.
+    #[cfg(target_os = "macos")]
+    {
+        // Read from the captured session directly (no manager lock) — this
+        // stays correct even if the global manager has since been swapped by
+        // a Stop/Start of a different session.
+        let sys_device_name = session.get_system_device().map(|d| d.name.clone());
+        if let Some(name) = sys_device_name {
+            match super::recording_manager::wake_audio_connection_for_swap(&name).await {
+                Ok(()) => info!("[MIC_FALLBACK] Pre-swap audio wake completed"),
+                Err(e) => warn!(
+                    "[MIC_FALLBACK] Pre-swap audio wake failed: {} — proceeding anyway",
+                    e
+                ),
+            }
+        } else {
+            log::debug!("[MIC_FALLBACK] No system device recorded — skipping pre-swap wake");
+        }
+    }
+
+    // Stop may have started during the sleeps above — bail before touching
+    // the (possibly already taken) manager.
+    if !session_live(&session) {
+        info!("[MIC_FALLBACK] Recording stopping — aborting fallback for '{}'", disconnected_name);
+        return;
+    }
+
+    // perform_mic_hot_swap_task performs its own retry-once logic on failure
+    // and emits the mic-device-switched / mic-swap-failed events, so we can
+    // just delegate here. It does NOT touch MIC_SWAP_IN_PROGRESS internally.
+    match perform_mic_hot_swap_task(fallback_name.clone(), &session, app.clone()).await {
+        Ok(()) => {
+            info!(
+                "[MIC_FALLBACK] Fallback complete: now recording via '{}'",
+                fallback_name
+            );
+            MIC_FALLBACK_FAILED_ATTEMPTS.store(0, Ordering::SeqCst);
+        }
+        Err(e) => {
+            error!("[MIC_FALLBACK] Fallback swap failed: {}", e);
+            if !session_live(&session) {
+                return;
+            }
+            let n = MIC_FALLBACK_FAILED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == MAX_MIC_FALLBACK_ATTEMPTS {
+                let _ = app.emit(
+                    "mic-recovery-exhausted",
+                    serde_json::json!({ "device_name": disconnected_name }),
+                );
+            }
         }
     }
 }

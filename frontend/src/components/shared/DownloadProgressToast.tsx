@@ -4,6 +4,8 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { X, Download, Check, Loader2, ArrowBigDownDash } from 'lucide-react';
+import { getDownloadTotalMb } from '@/lib/onboarding-summary-model';
+import type { ParakeetDownloadProgressEvent } from '@/lib/parakeet';
 
 interface DownloadProgress {
   modelName: string;
@@ -13,6 +15,7 @@ interface DownloadProgress {
   totalMb: number;
   speedMbps: number;
   status: 'downloading' | 'completed' | 'error' | 'cancelled';
+  unitLabel?: string;
   error?: string;
 }
 
@@ -56,6 +59,7 @@ function DownloadToastContent({
   const isComplete = download.status === 'completed';
   const hasError = download.status === 'error';
   const isCancelled = download.status === 'cancelled';
+  const unitLabel = download.unitLabel ?? 'MB';
 
   return (
     <div className="flex items-center gap-3 w-full max-w-sm bg-white rounded-lg shadow-lg border border-gray-200 p-3 relative">
@@ -101,11 +105,11 @@ function DownloadToastContent({
             {/* Progress text */}
             <div className="flex items-center justify-between text-xs text-gray-500">
               <span>
-                {download.downloadedMb.toFixed(1)} / {download.totalMb.toFixed(1)} MB
+                {download.downloadedMb.toFixed(1)} / {download.totalMb.toFixed(1)} {unitLabel}
               </span>
               <span className="flex items-center gap-1">
                 {download.speedMbps > 0 && (
-                  <span>{download.speedMbps.toFixed(1)} MB/s</span>
+                  <span>{download.speedMbps.toFixed(1)} {unitLabel}/s</span>
                 )}
                 <span className="text-gray-900 font-medium">
                   {Math.round(download.progress)}%
@@ -218,38 +222,30 @@ export function useDownloadProgressToast() {
 
   // Listen to Parakeet download events
   useEffect(() => {
-    const unlistenProgress = listen<{
-      modelName: string;
-      progress: number;
-      downloaded_mb?: number;
-      total_mb?: number;
-      speed_mbps?: number;
-      status?: string;
-    }>('parakeet-model-download-progress', (event) => {
-      const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
+    const unlistenProgress = listen<ParakeetDownloadProgressEvent>(
+      'parakeet-model-download-progress',
+      (event) => {
+        const { modelName, progress, downloaded_mb, total_mb, speed_mbps, status } = event.payload;
+        const downloadData: DownloadProgress = {
+          modelName,
+          displayName: 'Transcription Model (Parakeet)',
+          progress,
+          downloadedMb: downloaded_mb ?? 0,
+          totalMb: total_mb ?? 670,
+          speedMbps: speed_mbps ?? 0,
+          status: status === 'cancelled'
+            ? 'cancelled'
+            : status === 'completed'
+              ? 'completed'
+              : 'downloading',
+        };
 
-      const downloadData: DownloadProgress = {
-        modelName,
-        displayName: 'Transcription Model (Parakeet)',
-        progress,
-        downloadedMb: downloaded_mb ?? 0,
-        totalMb: total_mb ?? 670,
-        speedMbps: speed_mbps ?? 0,
-        status: status === 'cancelled'
-          ? 'cancelled'
-          : status === 'completed' || progress >= 100
-          ? 'completed'
-          : 'downloading',
-      };
-
-      updateDownload(modelName, downloadData);
-
-      // Clean up cancelled downloads after delay to auto-dismiss toast
-      if (downloadData.status === 'cancelled') {
-        cleanupDownload(modelName, 6000); // 5s toast + 1s buffer
+        updateDownload(modelName, downloadData);
+        if (downloadData.status === 'cancelled') {
+          cleanupDownload(modelName, 6000);
+        }
       }
-      // Removed direct showDownloadToast call here, handled by effect
-    });
+    );
 
     const unlistenComplete = listen<{ modelName: string }>(
       'parakeet-model-download-complete',
@@ -297,7 +293,7 @@ export function useDownloadProgressToast() {
     };
   }, [updateDownload, cleanupDownload]);
 
-  // Listen to Built-in AI (Gemma) download events
+  // Listen to Built-in AI summary model download events
   useEffect(() => {
     const unlisten = listen<{
       model: string;
@@ -315,8 +311,9 @@ export function useDownloadProgressToast() {
         displayName: `Summary Model (${model})`,
         progress: progress ?? 0,
         downloadedMb: downloaded_mb ?? 0,
-        totalMb: total_mb ?? (model.includes('4b') ? 2500 : 806),
+        totalMb: getDownloadTotalMb(total_mb, model),
         speedMbps: speed_mbps ?? 0,
+        unitLabel: 'MiB',
         status: status === 'completed' || progress >= 100
           ? 'completed'
           : status === 'cancelled'

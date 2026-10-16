@@ -48,7 +48,7 @@ pub fn build_headless_app() -> tauri::Result<tauri::App> {
     use tokio::sync::RwLock;
     type NotifState = Arc<RwLock<Option<notifications::manager::NotificationManager<tauri::Wry>>>>;
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
@@ -59,7 +59,12 @@ pub fn build_headless_app() -> tauri::Result<tauri::App> {
         .manage(summary::summary_engine::ModelManagerState(Arc::new(
             tokio::sync::Mutex::new(None),
         )))
-        .build(tauri::generate_context!())
+        .build(tauri::generate_context!())?;
+
+    // Same bundled ONNX Runtime as the app: Parakeet and the VAD depend on it
+    crate::init_bundled_onnx_runtime(app.handle());
+
+    Ok(app)
 }
 
 /// Inicializa o banco no mesmo caminho do app (app_data_dir → meeting_minutes.sqlite).
@@ -1113,7 +1118,9 @@ pub async fn summarize_meeting(
     let pool = app.state::<AppState>().db_manager.pool().clone();
 
     // (1) cria/zera o processo e (2) grava os chunks — igual a api_process_transcript.
-    SummaryProcessesRepository::create_or_reset_process(&pool, meeting_id)
+    // `started_at` identifies this generation run (cancellation and stale-write guards).
+    let started_at = chrono::Utc::now();
+    SummaryProcessesRepository::create_or_reset_process(&pool, meeting_id, started_at)
         .await
         .map_err(|e| format!("Failed to initialize the summary process: {}", e))?;
 
@@ -1142,16 +1149,35 @@ pub async fn summarize_meeting(
         }
     });
 
+    // Per-meeting summary language override saved by the app (metadata.json), if any
+    let summary_language = crate::database::repositories::meeting::MeetingsRepository::get_meeting_metadata(
+        &pool, meeting_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|meeting| meeting.folder_path)
+    .filter(|folder| !folder.trim().is_empty())
+    .and_then(|folder| {
+        crate::summary::metadata::read_summary_language_from_metadata(std::path::Path::new(&folder))
+            .ok()
+            .flatten()
+    });
+
     // Aguarda o processamento (persiste status/result no banco internamente).
+    let cancellation_token = SummaryService::register_cancellation_token(meeting_id, started_at);
     SummaryService::process_transcript_background(
         app.clone(),
         pool.clone(),
         meeting_id.to_string(),
+        started_at,
+        cancellation_token,
         text,
         provider,
         model,
         template_id,
         auto_tag,
+        summary_language,
     )
     .await;
 

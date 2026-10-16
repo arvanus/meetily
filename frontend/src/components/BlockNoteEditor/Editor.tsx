@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { PartialBlock, Block } from "@blocknote/core";
+import type { PartialBlock, Block } from "@blocknote/core";
+import { useCreateBlockNote } from "@blocknote/react";
+import { BlockNoteView } from "@blocknote/shadcn";
 import "@blocknote/shadcn/style.css";
 import "@blocknote/core/fonts/inter.css";
 
@@ -32,15 +34,13 @@ function sanitizeBlocks(blocks: Block[] | undefined): PartialBlock[] | undefined
 export default function Editor({ initialContent, onChange, editable = true }: EditorProps) {
   const [hasError, setHasError] = useState(false);
 
-  // Lazy import to avoid SSR issues
-  const { useCreateBlockNote } = require("@blocknote/react");
-  const { BlockNoteView } = require("@blocknote/shadcn");
-
   const sanitizedContent = sanitizeBlocks(initialContent);
 
   const editor = useCreateBlockNote({
     initialContent: sanitizedContent,
   });
+
+  console.log('📝 EDITOR: BlockNote editor created successfully');
 
   // Handle content changes
   useEffect(() => {

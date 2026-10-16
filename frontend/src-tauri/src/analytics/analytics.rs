@@ -6,6 +6,34 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
+const SENSITIVE_ANALYTICS_KEYS: &[&str] = &[
+    "meeting_title",
+    "meetingTitle",
+    "meeting_name",
+    "meetingName",
+    "file_name",
+    "filename",
+    "file_path",
+    "folder_path",
+    "path",
+    "source_path",
+    "meeting_folder_path",
+    "device_name",
+    "user_agent",
+];
+
+fn sanitize_analytics_properties(mut properties: HashMap<String, String>) -> HashMap<String, String> {
+    properties.retain(|key, _| !SENSITIVE_ANALYTICS_KEYS.contains(&key.as_str()));
+    properties
+}
+
+fn meeting_started_properties(meeting_id: &str) -> HashMap<String, String> {
+    let mut properties = HashMap::new();
+    properties.insert("meeting_id".to_string(), meeting_id.to_string());
+    properties.insert("timestamp".to_string(), chrono::Utc::now().to_rfc3339());
+    properties
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsConfig {
     pub api_key: String,
@@ -79,7 +107,7 @@ impl AnalyticsClient {
         // Store user ID for future events
         *self.user_id.lock().await = Some(user_id.clone());
 
-        let properties = properties.unwrap_or_default();
+        let properties = sanitize_analytics_properties(properties.unwrap_or_default());
         
         let mut event = Event::new("$identify", &user_id);
         
@@ -113,7 +141,7 @@ impl AnalyticsClient {
         };
 
         let event_name = event_name.to_string();
-        let mut properties = properties.unwrap_or_default();
+        let mut properties = sanitize_analytics_properties(properties.unwrap_or_default());
 
         // Add app version to all events
         properties.insert("app_version".to_string(), env!("CARGO_PKG_VERSION").to_string());
@@ -157,9 +185,12 @@ impl AnalyticsClient {
     }
 
     pub async fn end_session(&self) -> Result<(), String> {
-        let mut session_guard = self.current_session.lock().await;
+        let session = {
+            let mut session_guard = self.current_session.lock().await;
+            session_guard.take()
+        };
         
-        if let Some(session) = session_guard.take() {
+        if let Some(session) = session {
             let mut properties = HashMap::new();
             properties.insert("session_id".to_string(), session.session_id.clone());
             properties.insert("session_duration".to_string(), session.duration_seconds().to_string());
@@ -207,13 +238,8 @@ impl AnalyticsClient {
     }
 
     // Meeting-specific event tracking methods
-    pub async fn track_meeting_started(&self, meeting_id: &str, meeting_title: &str) -> Result<(), String> {
-        let mut properties = HashMap::new();
-        properties.insert("meeting_id".to_string(), meeting_id.to_string());
-        properties.insert("meeting_title".to_string(), meeting_title.to_string());
-        properties.insert("timestamp".to_string(), chrono::Utc::now().to_rfc3339());
-        
-        self.track_event("meeting_started", Some(properties)).await
+    pub async fn track_meeting_started(&self, meeting_id: &str) -> Result<(), String> {
+        self.track_event("meeting_started", Some(meeting_started_properties(meeting_id))).await
     }
 
     pub async fn track_recording_started(&self, meeting_id: &str) -> Result<(), String> {
@@ -411,6 +437,7 @@ impl AnalyticsClient {
             }
         };
         
+        let properties = sanitize_analytics_properties(properties);
         let mut event = Event::new("$set", &user_id);
         
         // Add user properties
@@ -431,4 +458,115 @@ impl AnalyticsClient {
 // Helper function to create analytics client from config
 pub async fn create_analytics_client(config: AnalyticsConfig) -> AnalyticsClient {
     AnalyticsClient::new(config).await
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::{timeout, Duration},
+    };
+
+
+    #[test]
+    fn analytics_properties_drop_sensitive_meeting_metadata() {
+        let mut properties = HashMap::new();
+        properties.insert("meeting_title".to_string(), "Board Strategy".to_string());
+        properties.insert("meetingTitle".to_string(), "Board Strategy".to_string());
+        properties.insert("meeting_name".to_string(), "Client Call".to_string());
+        properties.insert("meetingName".to_string(), "Client Call".to_string());
+        properties.insert("file_name".to_string(), "acquisition.wav".to_string());
+        properties.insert("filename".to_string(), "acquisition.wav".to_string());
+        properties.insert("file_path".to_string(), "C:\\meetings\\acquisition.wav".to_string());
+        properties.insert("folder_path".to_string(), "C:\\meetings".to_string());
+        properties.insert("path".to_string(), "C:\\meetings\\acquisition.wav".to_string());
+        properties.insert("source_path".to_string(), "C:\\imports\\source.wav".to_string());
+        properties.insert("meeting_folder_path".to_string(), "C:\\meetings\\private".to_string());
+        properties.insert("device_name".to_string(), "Jane's AirPods".to_string());
+        properties.insert("user_agent".to_string(), "Mozilla/5.0".to_string());
+        properties.insert("meeting_id".to_string(), "meeting-123".to_string());
+        properties.insert("duration_seconds".to_string(), "125".to_string());
+        properties.insert("segments_count".to_string(), "42".to_string());
+        properties.insert("model_name".to_string(), "parakeet".to_string());
+        properties.insert("platform".to_string(), "Windows".to_string());
+
+        let sanitized = sanitize_analytics_properties(properties);
+
+        for key in [
+            "meeting_title",
+            "meetingTitle",
+            "meeting_name",
+            "meetingName",
+            "file_name",
+            "filename",
+            "file_path",
+            "folder_path",
+            "path",
+            "source_path",
+            "meeting_folder_path",
+            "device_name",
+            "user_agent",
+        ] {
+            assert!(!sanitized.contains_key(key), "sensitive key remained: {}", key);
+        }
+
+        assert_eq!(sanitized.get("meeting_id"), Some(&"meeting-123".to_string()));
+        assert_eq!(sanitized.get("duration_seconds"), Some(&"125".to_string()));
+        assert_eq!(sanitized.get("segments_count"), Some(&"42".to_string()));
+        assert_eq!(sanitized.get("model_name"), Some(&"parakeet".to_string()));
+        assert_eq!(sanitized.get("platform"), Some(&"Windows".to_string()));
+    }
+
+    #[tokio::test]
+    async fn ending_session_completes_and_emits_an_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let capture_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let bytes_read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..bytes_read]).contains("session_ended"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let analytics = AnalyticsClient {
+            client: Some(Arc::new(
+                posthog_rs::client(
+                    posthog_rs::ClientOptionsBuilder::default()
+                        .api_key("test".to_string())
+                        .api_endpoint(endpoint.clone())
+                        .request_timeout_seconds(1)
+                        .build()
+                        .unwrap(),
+                )
+                .await,
+            )),
+            config: AnalyticsConfig {
+                api_key: "test".to_string(),
+                host: Some(endpoint),
+                enabled: true,
+            },
+            user_id: Arc::new(Mutex::new(Some("user".to_string()))),
+            current_session: Arc::new(Mutex::new(Some(UserSession::new("user".to_string())))),
+        };
+
+        timeout(Duration::from_secs(1), analytics.end_session())
+            .await
+            .expect("ending a session must not wait on its own session mutex")
+            .unwrap();
+        capture_server.await.unwrap();
+    }
+
+    #[test]
+    fn meeting_started_properties_do_not_include_title() {
+        let properties = meeting_started_properties("meeting-123");
+
+        assert_eq!(properties.get("meeting_id"), Some(&"meeting-123".to_string()));
+        assert!(properties.contains_key("timestamp"));
+        assert!(!properties.contains_key("meeting_title"));
+    }
+}
