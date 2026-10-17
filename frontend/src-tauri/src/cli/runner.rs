@@ -1096,6 +1096,45 @@ pub async fn run_list_templates() -> Result<(), String> {
     Ok(())
 }
 
+/// Summary output language, resolved the same way as the app's `resolveSummaryLanguage`
+/// (useSummaryGeneration.ts): the per-meeting override, then the detected language cached
+/// in metadata.json, then detection on the raw transcript texts (cached for the next run).
+/// `None` makes the backend return the English base summary.
+fn resolve_summary_language(
+    meeting_folder: Option<&std::path::Path>,
+    transcript_texts: &[String],
+) -> Option<String> {
+    use crate::summary::language_detection::{detect_summary_language, SummaryLanguageDetectionReason};
+    use crate::summary::metadata::{
+        read_detected_summary_language_from_metadata, read_summary_language_from_metadata,
+        write_detected_summary_language_to_metadata,
+    };
+
+    if let Some(folder) = meeting_folder {
+        match read_summary_language_from_metadata(folder) {
+            Ok(Some(language)) => return Some(language),
+            Ok(None) => {}
+            Err(e) => eprintln!("Warning: could not load the saved summary language, using Auto: {}", e),
+        }
+        match read_detected_summary_language_from_metadata(folder) {
+            Ok(Some(language)) => return Some(language),
+            Ok(None) => {}
+            Err(e) => eprintln!("Warning: could not load the cached detected summary language: {}", e),
+        }
+    }
+
+    let detection = detect_summary_language(transcript_texts);
+    if detection.reason == SummaryLanguageDetectionReason::Tie {
+        eprintln!("Warning: bilingual transcript detected; set the summary language in the app if Auto picks the wrong one.");
+    }
+    if let (Some(folder), Some(language)) = (meeting_folder, detection.language.as_deref()) {
+        if let Err(e) = write_detected_summary_language_to_metadata(folder, Some(language)) {
+            eprintln!("Warning: could not cache the detected summary language: {}", e);
+        }
+    }
+    detection.language
+}
+
 /// Núcleo da geração de sumário pela CLI: espelha `api_process_transcript`, mas
 /// AGUARDA o processamento (em vez de `spawn`). Mostra um spinner com tempo
 /// decorrido enquanto o LLM trabalha e, ao final, lê o status persistido para
@@ -1104,6 +1143,7 @@ pub async fn summarize_meeting(
     app: &tauri::AppHandle,
     meeting_id: &str,
     text: String,
+    transcript_texts: Vec<String>,
     provider: String,
     model: String,
     template_id: String,
@@ -1116,6 +1156,18 @@ pub async fn summarize_meeting(
     use crate::summary::service::SummaryService;
 
     let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    // Resolved before the spinner starts so its warnings don't land on the spinner line
+    let meeting_folder = crate::database::repositories::meeting::MeetingsRepository::get_meeting_metadata(
+        &pool, meeting_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|meeting| meeting.folder_path)
+    .filter(|folder| !folder.trim().is_empty())
+    .map(std::path::PathBuf::from);
+    let summary_language = resolve_summary_language(meeting_folder.as_deref(), &transcript_texts);
 
     // (1) cria/zera o processo e (2) grava os chunks — igual a api_process_transcript.
     // `started_at` identifies this generation run (cancellation and stale-write guards).
@@ -1147,21 +1199,6 @@ pub async fn summarize_meeting(
             );
             let _ = std::io::stdout().flush();
         }
-    });
-
-    // Per-meeting summary language override saved by the app (metadata.json), if any
-    let summary_language = crate::database::repositories::meeting::MeetingsRepository::get_meeting_metadata(
-        &pool, meeting_id,
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|meeting| meeting.folder_path)
-    .filter(|folder| !folder.trim().is_empty())
-    .and_then(|folder| {
-        crate::summary::metadata::read_summary_language_from_metadata(std::path::Path::new(&folder))
-            .ok()
-            .flatten()
     });
 
     // Aguarda o processamento (persiste status/result no banco internamente).
@@ -1489,7 +1526,9 @@ async fn summarize_existing_meeting(
         }
     };
 
-    summarize_meeting(app, meeting_id, text, provider, model, template_id, auto_tag).await
+    // Raw segment texts, without speaker prefixes, drive the summary language detection
+    let transcript_texts = details.transcripts.iter().map(|t| t.text.clone()).collect();
+    summarize_meeting(app, meeting_id, text, transcript_texts, provider, model, template_id, auto_tag).await
 }
 
 /// Gera o sumário de uma reunião existente, escolhida por `--meeting <id>` ou
