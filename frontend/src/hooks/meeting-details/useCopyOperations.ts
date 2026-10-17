@@ -1,5 +1,6 @@
 import { useCallback, RefObject } from 'react';
 import { Transcript, Summary } from '@/types';
+import { getLocalUserName, speakerPrefix } from '@/lib/speaker';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
@@ -85,8 +86,9 @@ export function useCopyOperations({
 
     const header = `# Transcript of the Meeting: ${meeting.id} - ${meetingTitle ?? meeting.title}\n\n`;
     const date = `## Date: ${new Date(meeting.created_at).toLocaleDateString()}\n\n`;
+    const userName = await getLocalUserName();
     const fullTranscript = allTranscripts
-      .map(t => `${formatTime(t.audio_start_time, t.timestamp)} ${t.text}  `)
+      .map(t => `${formatTime(t.audio_start_time, t.timestamp)} ${speakerPrefix(t.speaker, userName)}${t.text}  `)
       .join('\n');
 
     await navigator.clipboard.writeText(header + date + fullTranscript);

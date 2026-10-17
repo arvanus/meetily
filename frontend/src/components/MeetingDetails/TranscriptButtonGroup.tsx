@@ -3,9 +3,10 @@
 import { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, FolderOpen, RefreshCw, Users } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
+import { DiarizationDialog } from './DiarizationDialog';
 import { useConfig } from '@/contexts/ConfigContext';
 
 
@@ -29,6 +30,7 @@ export function TranscriptButtonGroup({
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
+  const [showDiarizationDialog, setShowDiarizationDialog] = useState(false);
 
   const handleRetranscribeComplete = useCallback(async () => {
     // Refetch transcripts to show the updated data
@@ -83,16 +85,42 @@ export function TranscriptButtonGroup({
             <span className="hidden lg:inline">Enhance</span>
           </Button>
         )}
+
+        {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="xl:px-4"
+            onClick={() => {
+              Analytics.trackButtonClick('identify_speakers', 'meeting_details');
+              setShowDiarizationDialog(true);
+            }}
+            disabled={transcriptCount === 0}
+            title="Identify who said what (speaker diarization)"
+          >
+            <Users className="xl:mr-2" size={18} />
+            <span className="hidden lg:inline">Speakers</span>
+          </Button>
+        )}
       </ButtonGroup>
 
       {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
-        <RetranscribeDialog
-          open={showRetranscribeDialog}
-          onOpenChange={setShowRetranscribeDialog}
-          meetingId={meetingId}
-          meetingFolderPath={meetingFolderPath}
-          onComplete={handleRetranscribeComplete}
-        />
+        <>
+          <RetranscribeDialog
+            open={showRetranscribeDialog}
+            onOpenChange={setShowRetranscribeDialog}
+            meetingId={meetingId}
+            meetingFolderPath={meetingFolderPath}
+            onComplete={handleRetranscribeComplete}
+          />
+          <DiarizationDialog
+            open={showDiarizationDialog}
+            onOpenChange={setShowDiarizationDialog}
+            meetingId={meetingId}
+            meetingFolderPath={meetingFolderPath}
+            onComplete={handleRetranscribeComplete}
+          />
+        </>
       )}
     </div>
   );

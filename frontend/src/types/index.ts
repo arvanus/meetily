@@ -18,6 +18,8 @@ export interface Transcript {
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
   // Audio source: "mic", "system", or undefined (mono/mixed)
   source?: string;
+  // Speaker label from the database: "mic", "system" or a diarization label (e.g. "SPEAKER_00")
+  speaker?: string;
 }
 
 export interface TranscriptUpdate {
@@ -110,4 +112,5 @@ export interface TranscriptSegmentData {
   text: string;
   confidence?: number;
   is_partial?: boolean;
+  speaker?: string;
 }

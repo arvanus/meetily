@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import { Transcript, Summary } from '@/types';
+import { getLocalUserName, speakerPrefix } from '@/lib/speaker';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
@@ -568,11 +569,11 @@ export function useSummaryGeneration({
       return `[${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
     };
 
+    const userName = await getLocalUserName();
     const fullTranscript = allTranscripts
       .map(t => {
         const time = formatTime(t.audio_start_time, t.timestamp);
-        const source = t.source ? `[${t.source === 'mic' ? 'Mic' : 'System'}] ` : '';
-        return `${time} ${source}${t.text}`;
+        return `${time} ${speakerPrefix(t.speaker, userName)}${t.text}`;
       })
       .join('\n');
 

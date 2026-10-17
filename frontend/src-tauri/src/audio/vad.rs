@@ -366,8 +366,11 @@ impl ContinuousVadProcessor {
                     self.last_logged_state = true;
                 }
                 self.in_speech = true;
-                // Use 16000 (VAD processing rate) since processed_samples counts 16kHz samples
-                self.speech_start_sample = self.processed_samples + (timestamp_ms * 16000 / 1000);
+                // silero's timestamp_ms is already measured from the start of the VAD session
+                // (not from the current chunk), so it maps straight to a 16kHz sample index.
+                // Adding processed_samples here doubled the start of every force-split,
+                // partial and flushed segment (e.g. speech at 33min reported at 66min).
+                self.speech_start_sample = timestamp_ms * 16000 / 1000;
                 self.current_speech.clear();
                 self.restore_base_redemption();
                 self.force_split_occurred = false;
@@ -726,6 +729,23 @@ mod tests {
         assert!((dur - 60_000.0).abs() < 100.0, "segment duration should be ~60s, got {}ms", dur);
         assert!(p.in_speech, "speech must continue after a force-split");
         assert!(p.current_speech.len() < 6 * 16000, "tail after split should restart accumulation");
+    }
+
+    #[test]
+    fn test_force_split_start_uses_session_timestamp() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        // Two minutes into the session, silero reports speech that started at 119.7s
+        p.processed_samples = 120 * 16000;
+        p.handle_transition(VadTransition::SpeechStart { timestamp_ms: 119_700 });
+        assert_eq!(p.speech_start_sample, 119_700 * 16, "start must be the session timestamp");
+
+        let finals = feed_speech_chunks(&mut p, 61 * 16000 / 480); // ~61s, no pause
+        assert_eq!(finals.len(), 1, "precondition: force-split happened");
+        let seg = &finals[0];
+        assert!((seg.start_timestamp_ms - 119_700.0).abs() < 1.0,
+            "force-split segment must start at 119.7s, got {}ms", seg.start_timestamp_ms);
+        assert!(seg.end_timestamp_ms > seg.start_timestamp_ms,
+            "segment must end after it starts ({} -> {})", seg.start_timestamp_ms, seg.end_timestamp_ms);
     }
 
     #[test]
