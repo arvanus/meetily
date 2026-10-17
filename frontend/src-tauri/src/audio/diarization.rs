@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_store::StoreExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
@@ -366,6 +367,13 @@ const DIARIZATION_OUTPUT: &str = "diarization.json";
 /// Number of trailing script output lines kept for error messages
 const ERROR_TAIL_LINES: usize = 6;
 
+/// Store file and key holding the Hugging Face token used to download the model
+const SETTINGS_STORE: &str = "diarization.json";
+const HF_TOKEN_KEY: &str = "hf_token";
+
+/// Gated diarization model; its conditions must be accepted once on Hugging Face
+const MODEL_URL: &str = "https://huggingface.co/pyannote/speaker-diarization-community-1";
+
 /// Global flag to track if diarization is in progress
 static DIARIZATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -420,6 +428,101 @@ pub fn parse_progress_line(line: &str) -> Option<(u32, String)> {
     let (percent, message) = rest.split_once(' ').unwrap_or((rest, ""));
     let percent: u32 = percent.parse().ok()?;
     Some((percent.min(100), message.trim().to_string()))
+}
+
+/// Parse an `ERROR <code> <message>` line printed by diarize.py on known failures
+pub fn parse_error_line(line: &str) -> Option<(String, String)> {
+    let rest = line.trim().strip_prefix("ERROR ")?;
+    let (code, message) = rest.split_once(' ').unwrap_or((rest, ""));
+    if code.is_empty() {
+        return None;
+    }
+    Some((code.to_string(), message.trim().to_string()))
+}
+
+/// User facing message for a known diarize.py failure code
+pub fn friendly_error_message(code: &str, details: &str) -> String {
+    let message = match code {
+        "hf_access" => format!(
+            "Hugging Face did not allow downloading the diarization model. With your Hugging Face \
+             account, accept the conditions at {} and set a read token (Hugging Face token field \
+             in the Speakers dialog, or the HF_TOKEN environment variable). The model is \
+             downloaded once; later runs do not need the token.",
+            MODEL_URL
+        ),
+        "hf_auth" => "Hugging Face rejected the token. Check it at \
+             https://huggingface.co/settings/tokens and save it again."
+            .to_string(),
+        "network" => "Could not reach Hugging Face to download the diarization model. The first \
+             run needs internet access; later runs work offline."
+            .to_string(),
+        "missing_dependency" => "The diarization Python environment is incomplete. Install the \
+             requirements as described in scripts/diarization/README.md."
+            .to_string(),
+        _ => "Diarization failed.".to_string(),
+    };
+    if details.is_empty() {
+        message
+    } else {
+        format!("{}\n\nDetails: {}", message, details)
+    }
+}
+
+/// Hugging Face token saved from the Speakers dialog, if any
+fn stored_hf_token<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let store = app.store(SETTINGS_STORE).ok()?;
+    store
+        .get(HF_TOKEN_KEY)
+        .and_then(|value| value.as_str().map(|s| s.trim().to_string()))
+        .filter(|token| !token.is_empty())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiarizationSettings {
+    /// A token is saved in the app settings
+    pub has_saved_token: bool,
+    /// HF_TOKEN is set in the app environment (used when no token is saved)
+    pub has_env_token: bool,
+    pub model_url: String,
+}
+
+#[tauri::command]
+pub async fn get_diarization_settings_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<DiarizationSettings, String> {
+    Ok(DiarizationSettings {
+        has_saved_token: stored_hf_token(&app).is_some(),
+        has_env_token: std::env::var("HF_TOKEN").map(|t| !t.trim().is_empty()).unwrap_or(false),
+        model_url: MODEL_URL.to_string(),
+    })
+}
+
+/// Save (or, with an empty value, remove) the Hugging Face token
+#[tauri::command]
+pub async fn set_diarization_hf_token_command<R: Runtime>(
+    app: AppHandle<R>,
+    token: Option<String>,
+) -> Result<(), String> {
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("Failed to access settings: {}", e))?;
+    match token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        Some(token) => {
+            // pyannote silently ignores tokens that do not look like Hugging Face ones
+            if !token.starts_with("hf_") {
+                return Err("Hugging Face tokens start with \"hf_\".".to_string());
+            }
+            store.set(HF_TOKEN_KEY, serde_json::Value::String(token));
+        }
+        None => {
+            store.delete(HF_TOKEN_KEY);
+        }
+    }
+    store
+        .save()
+        .map_err(|e| format!("Failed to save settings: {}", e))?;
+    info!("Diarization Hugging Face token updated");
+    Ok(())
 }
 
 /// Python interpreter for diarization: MEETILY_DIARIZE_PYTHON, or the venv
@@ -529,6 +632,10 @@ pub(crate) async fn run_diarization<R: Runtime>(
     if let Some(ffmpeg) = find_ffmpeg_path() {
         command.arg("--ffmpeg").arg(ffmpeg);
     }
+    // A token saved in the app wins over the HF_TOKEN the app was started with
+    if let Some(token) = stored_hf_token(app) {
+        command.env("HF_TOKEN", token);
+    }
     command
         .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         .stdin(Stdio::null())
@@ -543,7 +650,16 @@ pub(crate) async fn run_diarization<R: Runtime>(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    info!("Running diarization for meeting {}: {:?}", meeting_id, command);
+    // Not the Command itself: its Debug output includes the environment (the token)
+    info!(
+        "Running diarization for meeting {}: {} {} {} (num_speakers={:?}, max_speakers={:?})",
+        meeting_id,
+        python.display(),
+        script.display(),
+        folder.display(),
+        num_speakers,
+        max_speakers
+    );
     let mut child = command
         .spawn()
         .map_err(|e| anyhow!("Failed to start Python ({}): {}", python.display(), e))?;
@@ -556,6 +672,7 @@ pub(crate) async fn run_diarization<R: Runtime>(
     let mut reader = BufReader::new(stderr);
     let mut buffer = Vec::new();
     let mut tail: VecDeque<String> = VecDeque::new();
+    let mut known_error: Option<(String, String)> = None;
     loop {
         buffer.clear();
         let read = tokio::select! {
@@ -571,6 +688,9 @@ pub(crate) async fn run_diarization<R: Runtime>(
                 let line = String::from_utf8_lossy(&buffer);
                 if let Some((percent, message)) = parse_progress_line(&line) {
                     on_progress(percent * 95 / 100, &message);
+                } else if let Some(error) = parse_error_line(&line) {
+                    warn!("diarize.py reported {}: {}", error.0, error.1);
+                    known_error = Some(error);
                 } else {
                     let line = line.trim();
                     if !line.is_empty() {
@@ -593,6 +713,9 @@ pub(crate) async fn run_diarization<R: Runtime>(
         status = child.wait() => status.map_err(|e| anyhow!("Failed to wait for diarization: {}", e))?,
     };
     if !status.success() {
+        if let Some((code, details)) = known_error {
+            return Err(anyhow!("{}", friendly_error_message(&code, &details)));
+        }
         let details = tail.into_iter().collect::<Vec<_>>().join("\n");
         return Err(anyhow!("Diarization failed ({}):\n{}", status, details));
     }
@@ -693,6 +816,26 @@ mod tests {
         assert_eq!(speaker_display_name("SPEAKER_00"), "Speaker 1");
         assert_eq!(speaker_display_name("SPEAKER_12"), "Speaker 13");
         assert_eq!(speaker_display_name("Alice"), "Alice");
+    }
+
+    #[test]
+    fn test_parse_error_line() {
+        assert_eq!(
+            parse_error_line("ERROR hf_access GatedRepoError: 401 Client Error.\n"),
+            Some(("hf_access".to_string(), "GatedRepoError: 401 Client Error.".to_string()))
+        );
+        assert_eq!(parse_error_line("ERROR network"), Some(("network".to_string(), String::new())));
+        assert_eq!(parse_error_line("ERROR "), None);
+        assert_eq!(parse_error_line("RuntimeError: ffmpeg failed"), None);
+    }
+
+    #[test]
+    fn test_friendly_error_message() {
+        let access = friendly_error_message("hf_access", "GatedRepoError: 401");
+        assert!(access.contains(MODEL_URL), "must point to the model page: {}", access);
+        assert!(access.ends_with("Details: GatedRepoError: 401"));
+        assert!(friendly_error_message("network", "").contains("internet"));
+        assert_eq!(friendly_error_message("something_new", ""), "Diarization failed.");
     }
 
     #[test]

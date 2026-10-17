@@ -818,6 +818,8 @@ pub fn run() {
             audio::diarization::cancel_diarization_command,
             audio::diarization::is_diarization_in_progress_command,
             audio::diarization::get_local_user_name_command,
+            audio::diarization::get_diarization_settings_command,
+            audio::diarization::set_diarization_hf_token_command,
             get_build_info,
         ])
         .build(tauri::generate_context!())

@@ -56,10 +56,11 @@ Requirements: Python 3.10+, `ffmpeg` on PATH (or pass `--ffmpeg`), and a
 
    CPU works too, it is just slower. To use another Python, set
    `MEETILY_DIARIZE_PYTHON` to its executable.
-3. Set `HF_TOKEN` as a user environment variable (Windows: "Edit environment
-   variables for your account"; macOS / Linux: your shell profile), then
-   restart Meetily so it sees it. The model is downloaded once and cached;
-   after that it runs offline.
+3. Give the token to Meetily: paste it in the **Hugging Face token** field of
+   the Speakers dialog (saved in the app settings), or set `HF_TOKEN` as a
+   user environment variable and restart Meetily so it sees it. A saved token
+   wins over `HF_TOKEN`. The token is only used to download the model the first
+   time; after that the model is cached and runs offline, with or without it.
 
 ## Usage
 
@@ -137,6 +138,19 @@ information, so it is treated like a mono recording.
 
 Times are in seconds from the start of the audio file. `channel` is optional
 (`mic` or `system`); leave it out for mono audio.
+
+## Troubleshooting
+
+The script reports known failures as `ERROR <code> <message>` lines, which the
+app turns into a readable message:
+
+| Code | Meaning |
+|---|---|
+| `hf_access` | No token, an invalid token, or the model conditions not accepted yet |
+| `hf_auth` | The token was rejected |
+| `network` | Hugging Face could not be reached (only the first run needs internet) |
+| `missing_dependency` | `torch` or `pyannote.audio` missing from the Python environment |
+| `model_load` | Any other error while loading the model |
 
 ## Limitations
 

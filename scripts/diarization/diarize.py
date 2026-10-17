@@ -166,20 +166,49 @@ def mic_dominance_intervals(mic, system, sample_rate=SAMPLE_RATE, frame_seconds=
     return frames_to_intervals(mask, frame / sample_rate, max_gap, min_duration)
 
 
+class DiarizeError(Exception):
+    """Known failure, reported to the app as "ERROR <code> <message>" on stderr.
+
+    Codes: missing_dependency, hf_access, hf_auth, network, model_load.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def classify_hub_error(error):
+    """Map a model download/load exception to a DiarizeError code."""
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if names & {"GatedRepoError", "RepositoryNotFoundError"}:
+        return "hf_access"
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status in (401, 403):
+        return "hf_auth" if status == 401 else "hf_access"
+    if names & {"LocalEntryNotFoundError", "OfflineModeIsEnabled", "ConnectionError", "Timeout"}:
+        return "network"
+    return "model_load"
+
+
 def load_pipeline(model, token, device):
-    import torch
-    from pyannote.audio import Pipeline
+    try:
+        import torch
+        from pyannote.audio import Pipeline
+    except ImportError as e:
+        raise DiarizeError("missing_dependency",
+                           f"{e.name or e} is not installed for {sys.executable}") from e
 
     try:
-        pipeline = Pipeline.from_pretrained(model, token=token)
-    except TypeError:
-        # pyannote.audio 3.x
-        pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
+        try:
+            pipeline = Pipeline.from_pretrained(model, token=token)
+        except TypeError:
+            # pyannote.audio 3.x
+            pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
+    except Exception as e:
+        raise DiarizeError(classify_hub_error(e), f"{type(e).__name__}: {e}") from e
     if pipeline is None:
-        raise RuntimeError(
-            f"Could not load {model}. Accept the model conditions on Hugging Face "
-            "and pass a valid token (--hf-token or HF_TOKEN)."
-        )
+        raise DiarizeError("hf_access", f"Could not load {model}")
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -355,5 +384,15 @@ def main(argv=None):
     return 0
 
 
+def report_error(error):
+    """Print a DiarizeError in the format the app parses (single line)."""
+    message = " ".join(str(error.message).split())
+    print(f"ERROR {error.code} {message}", file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except DiarizeError as error:
+        report_error(error)
+        sys.exit(2)

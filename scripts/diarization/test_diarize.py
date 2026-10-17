@@ -135,6 +135,33 @@ class ProgressTest(unittest.TestCase):
         ])
 
 
+class ErrorTest(unittest.TestCase):
+    @staticmethod
+    def error_named(name, base=Exception, status=None):
+        cls = type(name, (base,), {})
+        error = cls("boom")
+        if status is not None:
+            error.response = type("Response", (), {"status_code": status})()
+        return error
+
+    def test_classify_hub_errors(self):
+        http = type("HfHubHTTPError", (Exception,), {})
+        not_found = type("RepositoryNotFoundError", (http,), {})
+        gated = type("GatedRepoError", (not_found,), {})
+        self.assertEqual(diarize.classify_hub_error(gated("x")), "hf_access")
+        self.assertEqual(diarize.classify_hub_error(not_found("x")), "hf_access")
+        self.assertEqual(diarize.classify_hub_error(self.error_named("HfHubHTTPError", status=401)), "hf_auth")
+        self.assertEqual(diarize.classify_hub_error(self.error_named("HfHubHTTPError", status=403)), "hf_access")
+        self.assertEqual(diarize.classify_hub_error(self.error_named("LocalEntryNotFoundError")), "network")
+        self.assertEqual(diarize.classify_hub_error(ValueError("bad config")), "model_load")
+
+    def test_report_error_is_single_line(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            diarize.report_error(diarize.DiarizeError("hf_access", "403 Client Error.\nAccess restricted"))
+        self.assertEqual(buffer.getvalue(), "ERROR hf_access 403 Client Error. Access restricted\n")
+
+
 class ResolveInputTest(unittest.TestCase):
     def test_folder_uses_metadata_audio_file(self):
         with tempfile.TemporaryDirectory() as tmp:

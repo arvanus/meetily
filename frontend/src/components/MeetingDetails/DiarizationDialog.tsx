@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Users, Loader2, AlertCircle, X, FileUp, Play } from 'lucide-react';
+import { Users, Loader2, AlertCircle, X, FileUp, Play, KeyRound } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -47,6 +47,12 @@ interface DiarizationError {
   error: string;
 }
 
+interface DiarizationSettings {
+  has_saved_token: boolean;
+  has_env_token: boolean;
+  model_url: string;
+}
+
 const CANCELLED_ERROR = 'Diarization cancelled';
 
 function showResultToast(result: DiarizationImportResult) {
@@ -66,6 +72,8 @@ export function DiarizationDialog({
 }: DiarizationDialogProps) {
   const [numSpeakers, setNumSpeakers] = useState('');
   const [isMaxSpeakers, setIsMaxSpeakers] = useState(false);
+  const [hfToken, setHfToken] = useState('');
+  const [settings, setSettings] = useState<DiarizationSettings | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [progress, setProgress] = useState<DiarizationProgress | null>(null);
@@ -86,6 +94,10 @@ export function DiarizationDialog({
     prevOpenRef.current = open;
     if (open && !wasOpen) {
       setError(null);
+      setHfToken('');
+      invoke<DiarizationSettings>('get_diarization_settings_command')
+        .then(setSettings)
+        .catch(() => setSettings(null));
       invoke<boolean>('is_diarization_in_progress_command')
         .then(running => {
           setIsProcessing(running);
@@ -158,11 +170,43 @@ export function DiarizationDialog({
     return Number.isFinite(value) && value > 0 ? value : null;
   };
 
+  // Save a newly typed token before running (empty field keeps the current one)
+  const saveTokenIfTyped = async (): Promise<boolean> => {
+    const token = hfToken.trim();
+    if (!token) return true;
+    try {
+      await invoke('set_diarization_hf_token_command', { token });
+      setHfToken('');
+      setSettings(s => (s ? { ...s, has_saved_token: true } : s));
+      return true;
+    } catch (err: any) {
+      setError(typeof err === 'string' ? err : (err?.message || String(err)));
+      return false;
+    }
+  };
+
+  const handleRemoveToken = async () => {
+    try {
+      await invoke('set_diarization_hf_token_command', { token: null });
+      setSettings(s => (s ? { ...s, has_saved_token: false } : s));
+      toast.info('Hugging Face token removed');
+    } catch (err) {
+      console.error('Failed to remove Hugging Face token:', err);
+    }
+  };
+
+  const openModelPage = () => {
+    if (settings?.model_url) {
+      invoke('open_external_url', { url: settings.model_url }).catch(console.error);
+    }
+  };
+
   const handleRun = async () => {
     if (!meetingFolderPath) {
       setError('Meeting folder path not available');
       return;
     }
+    if (!(await saveTokenIfTyped())) return;
 
     setIsProcessing(true);
     setError(null);
@@ -295,6 +339,40 @@ export function DiarizationDialog({
                 split one person into several speakers. Check "At most" when you only know
                 an upper bound. For recordings with separate audio tracks, count only the
                 other participants (not you).
+              </p>
+
+              <div className="flex items-center gap-2 pt-2">
+                <KeyRound className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-medium">Hugging Face token</span>
+              </div>
+              <Input
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  settings?.has_saved_token
+                    ? 'Saved (type a new one to replace it)'
+                    : settings?.has_env_token
+                      ? 'Using HF_TOKEN from the environment'
+                      : 'hf_...'
+                }
+                value={hfToken}
+                onChange={(e) => setHfToken(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Only needed the first time, to download the model: accept the model conditions
+                on{' '}
+                <button type="button" className="underline" onClick={openModelPage}>
+                  Hugging Face
+                </button>{' '}
+                and create a read token.
+                {settings?.has_saved_token && (
+                  <>
+                    {' '}
+                    <button type="button" className="underline" onClick={handleRemoveToken}>
+                      Remove saved token
+                    </button>
+                  </>
+                )}
               </p>
             </div>
           )}
