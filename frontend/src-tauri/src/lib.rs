@@ -937,6 +937,14 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Diarization import command
+            audio::diarization::import_diarization_command,
+            audio::diarization::start_diarization_command,
+            audio::diarization::cancel_diarization_command,
+            audio::diarization::is_diarization_in_progress_command,
+            audio::diarization::get_local_user_name_command,
+            audio::diarization::get_diarization_settings_command,
+            audio::diarization::set_diarization_hf_token_command,
             get_build_info,
         ])
         .build(tauri::generate_context!())

@@ -22,6 +22,8 @@ on:
     paths:
       - 'frontend/**'
       - 'llama-helper/**'
+      # diarize.py is embedded in the app (include_str!), so it is part of the build
+      - 'scripts/diarization/**'
       - 'Cargo.toml'
       - '.github/workflows/build-cuda-windows.yml'
   workflow_dispatch:

@@ -26,6 +26,13 @@ pub enum Command {
     Retranscribe(RetranscribeArgs),
     /// Generate the summary of a meeting (reuses the app's summary pipeline)
     Summarize(SummarizeArgs),
+    /// Identify speakers in a meeting transcript (pyannote speaker diarization).
+    ///
+    /// Runs scripts/diarization/diarize.py with the Python environment in
+    /// ~/.venvs/meetily-diarize (or MEETILY_DIARIZE_PYTHON), then merges the
+    /// speaker labels into the transcript. With --file, only imports a
+    /// diarization.json / .rttm produced elsewhere.
+    Diarize(DiarizeArgs),
 }
 
 #[derive(clap::Args, Debug, Default, Clone)]
@@ -240,10 +247,63 @@ impl SummarizeArgs {
     }
 }
 
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct DiarizeArgs {
+    /// Meeting id to diarize (use `list-meetings` to discover ids)
+    #[arg(long)]
+    pub meeting: Option<String>,
+    /// Diarize the most recent meeting instead of passing an id
+    #[arg(long)]
+    pub last: bool,
+    /// Exact number of speakers; for separate-track recordings, count only the
+    /// other participants. Improves accuracy a lot.
+    #[arg(long, conflicts_with = "max_speakers")]
+    pub num_speakers: Option<u32>,
+    /// Upper bound on the number of speakers, when the exact count is unknown.
+    /// Keeps pyannote from splitting one person into several on long meetings.
+    #[arg(long)]
+    pub max_speakers: Option<u32>,
+    /// Import this diarization file (.json or .rttm) instead of running pyannote
+    #[arg(long)]
+    pub file: Option<String>,
+}
+
+impl DiarizeArgs {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.file.is_some() && (self.num_speakers.is_some() || self.max_speakers.is_some()) {
+            return Err("--num-speakers / --max-speakers have no effect with --file.".to_string());
+        }
+        match (self.meeting.is_some(), self.last) {
+            (true, true) => Err("use either --meeting <id> or --last, not both.".to_string()),
+            (false, false) => {
+                Err("specify the meeting to diarize: --meeting <id> or --last.".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn diarize_requires_one_meeting_selector() {
+        let parse = |args: &[&str]| match Cli::parse_from(args).command {
+            Some(Command::Diarize(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        assert!(parse(&["meetily-cli", "diarize"]).validate().is_err());
+        assert!(parse(&["meetily-cli", "diarize", "--last", "--meeting", "m"]).validate().is_err());
+        assert!(parse(&["meetily-cli", "diarize", "--last"]).validate().is_ok());
+        let args = parse(&["meetily-cli", "diarize", "--meeting", "m", "--num-speakers", "4"]);
+        assert_eq!(args.num_speakers, Some(4));
+        assert!(args.validate().is_ok());
+        assert!(parse(&["meetily-cli", "diarize", "--last", "--file", "d.json", "--num-speakers", "2"])
+            .validate()
+            .is_err());
+    }
 
     #[test]
     fn record_only_with_no_audio_save_is_rejected() {

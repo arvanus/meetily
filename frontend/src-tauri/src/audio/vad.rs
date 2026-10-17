@@ -786,6 +786,23 @@ mod tests {
     }
 
     #[test]
+    fn test_force_split_start_uses_session_timestamp() {
+        let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
+        // Two minutes into the session, silero reports speech that started at 119.7s
+        p.processed_samples = 120 * 16000;
+        p.handle_transition(VadTransition::SpeechStart { timestamp_ms: 119_700 });
+        assert_eq!(p.speech_start_sample, 119_700 * 16, "start must be the session timestamp");
+
+        let finals = feed_speech_chunks(&mut p, 61 * 16000 / 480); // ~61s, no pause
+        assert_eq!(finals.len(), 1, "precondition: force-split happened");
+        let seg = &finals[0];
+        assert!((seg.start_timestamp_ms - 119_700.0).abs() < 1.0,
+            "force-split segment must start at 119.7s, got {}ms", seg.start_timestamp_ms);
+        assert!(seg.end_timestamp_ms > seg.start_timestamp_ms,
+            "segment must end after it starts ({} -> {})", seg.start_timestamp_ms, seg.end_timestamp_ms);
+    }
+
+    #[test]
     fn test_speech_end_after_force_split_does_not_duplicate_audio() {
         let mut p = ContinuousVadProcessor::new(16000, 2000).unwrap();
         p.in_speech = true;

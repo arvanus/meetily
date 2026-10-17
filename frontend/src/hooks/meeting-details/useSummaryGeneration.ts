@@ -6,6 +6,7 @@ import {
   SummaryProcessResponse,
   Transcript,
 } from '@/types';
+import { getLocalUserName, speakerPrefix } from '@/lib/speaker';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
@@ -444,7 +445,7 @@ export function useSummaryGeneration({
     }
   }, []);
 
-  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[]) => {
+  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[], userName: string | null) => {
     const formatTime = (seconds: number | undefined, fallbackTimestamp: string): string => {
       if (seconds === undefined) {
         return fallbackTimestamp;
@@ -457,10 +458,7 @@ export function useSummaryGeneration({
       transcriptText: allTranscripts
         .map((transcript) => {
           const time = formatTime(transcript.audio_start_time, transcript.timestamp);
-          const source = transcript.source
-            ? `[${transcript.source === 'mic' ? 'Mic' : 'System'}] `
-            : '';
-          return `${time} ${source}${transcript.text}`;
+          return `${time} ${speakerPrefix(transcript.speaker, userName)}${transcript.text}`;
         })
         .join('\n'),
       transcriptTexts: allTranscripts.map((transcript) => transcript.text),
@@ -516,7 +514,8 @@ export function useSummaryGeneration({
       return;
     }
 
-    await processSummary(buildSummaryTranscriptPayload(allTranscripts));
+    const userName = await getLocalUserName();
+    await processSummary(buildSummaryTranscriptPayload(allTranscripts, userName));
   }, [
     buildSummaryTranscriptPayload,
     fetchAllTranscripts,
@@ -538,8 +537,9 @@ export function useSummaryGeneration({
       return;
     }
 
+    const userName = await getLocalUserName();
     await processSummary({
-      ...buildSummaryTranscriptPayload(allTranscripts),
+      ...buildSummaryTranscriptPayload(allTranscripts, userName),
       isRegeneration: true
     });
   }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary]);

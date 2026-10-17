@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
+import { formatSpeakerLabel, speakerColorIndex } from "@/lib/speaker";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -66,6 +67,18 @@ function cleanStopWords(text: string): string {
     return cleanedText.replace(/\s+/g, ' ').trim();
 }
 
+// Speaker label colors: slot 0 is the local user, then one color per speaker
+const SPEAKER_COLORS = [
+    'text-blue-700',
+    'text-emerald-700',
+    'text-amber-700',
+    'text-purple-700',
+    'text-rose-700',
+    'text-cyan-700',
+    'text-orange-700',
+    'text-teal-700',
+];
+
 // Memoized transcript segment component
 const TranscriptSegment = memo(function TranscriptSegment({
     id,
@@ -75,6 +88,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming,
     showConfidence,
     isPartial,
+    speaker,
 }: {
     id: string;
     timestamp: number;
@@ -83,8 +97,13 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming: boolean;
     showConfidence: boolean;
     isPartial?: boolean;
+    speaker?: string;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const speakerLabel = formatSpeakerLabel(speaker);
+    const speakerColor = speaker
+        ? SPEAKER_COLORS[speakerColorIndex(speaker) % SPEAKER_COLORS.length]
+        : '';
 
     return (
         <div id={`segment-${id}`} className="mb-3">
@@ -102,6 +121,11 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
+                    {speakerLabel && (
+                        <span className={`block text-xs font-semibold ${speakerColor}`}>
+                            {speakerLabel}
+                        </span>
+                    )}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -305,6 +329,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         isPartial={segment.is_partial}
+                                        speaker={segment.speaker}
                                     />
                                 </div>
                             );
@@ -375,6 +400,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         isPartial={segment.is_partial}
+                                        speaker={segment.speaker}
                                     />
                                 </motion.div>
                             );

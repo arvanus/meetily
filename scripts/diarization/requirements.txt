@@ -1,0 +1,3 @@
+# Install PyTorch first (CUDA build if you have an NVIDIA GPU), see README.md
+pyannote.audio>=4.0
+numpy

@@ -1,4 +1,4 @@
-use crate::cli::args::{RecordArgs, RetranscribeArgs, SummarizeArgs};
+use crate::cli::args::{DiarizeArgs, RecordArgs, RetranscribeArgs, SummarizeArgs};
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
 use std::io::Write;
@@ -1443,10 +1443,19 @@ async fn summarize_existing_meeting(
         }
         Err(e) => return Err(format!("Failed to load the meeting: {}", e)),
     };
+    // Same "[Speaker] text" lines the app sends, so the summary can attribute who said what
+    let user_name = crate::audio::diarization::local_user_name();
     let text = details
         .transcripts
         .iter()
-        .map(|t| t.text.as_str())
+        .map(|t| match t.speaker.as_deref() {
+            Some(speaker) => format!(
+                "[{}] {}",
+                crate::audio::diarization::speaker_summary_label(speaker, user_name.as_deref()),
+                t.text
+            ),
+            None => t.text.clone(),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if text.trim().is_empty() {
@@ -1513,6 +1522,114 @@ pub async fn run_summarize(app: &tauri::AppHandle, args: SummarizeArgs) -> Resul
     .await?;
 
     println!("✓ Summary saved. meeting_id={}", meeting_id);
+    Ok(())
+}
+
+/// Identify speakers in an existing meeting (`--meeting <id>` or `--last`): runs the
+/// diarization script, or imports `--file`, and prints the speaker breakdown.
+pub async fn run_diarize(app: &tauri::AppHandle, args: DiarizeArgs) -> Result<(), String> {
+    use crate::audio::diarization::{import_diarization, run_diarization};
+    use crate::database::repositories::meeting::{MeetingsRepository, STATUS_COMPLETED};
+    use crate::audio::diarization::speaker_display_name;
+
+    args.validate()?;
+
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    let meeting_id = if let Some(id) = args.meeting.clone() {
+        id
+    } else {
+        // --last: the most recent one (get_meetings already orders by created_at DESC).
+        let meetings = MeetingsRepository::get_meetings(&pool)
+            .await
+            .map_err(|e| format!("Failed to list meetings: {}", e))?;
+        meetings
+            .first()
+            .map(|m| m.id.clone())
+            .ok_or_else(|| "No meetings found.".to_string())?
+    };
+
+    let folder = match MeetingsRepository::get_meeting_metadata(&pool, &meeting_id).await {
+        Ok(Some(m)) => {
+            if m.status != STATUS_COMPLETED {
+                return Err(format!(
+                    "Meeting {} is still being recorded (status: {}); wait for it to finish.",
+                    meeting_id, m.status
+                ));
+            }
+            m.folder_path
+        }
+        Ok(None) | Err(sqlx::Error::RowNotFound) => {
+            return Err(format!("Meeting {} not found.", meeting_id))
+        }
+        Err(e) => return Err(format!("Failed to load the meeting: {}", e)),
+    };
+
+    let result = if let Some(file) = args.file.as_deref() {
+        import_diarization(app, &meeting_id, file)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        let folder = folder.ok_or_else(|| {
+            format!(
+                "Meeting {} has no folder on disk; there is no audio to diarize.",
+                meeting_id
+            )
+        })?;
+
+        // Ctrl+C cancels the run (kills the Python process) instead of leaving it behind
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_on_ctrl_c = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel_on_ctrl_c.cancel();
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let on_progress = |percent: u32, message: &str| {
+            print!("\r\x1b[2K[{:>3}%] {}", percent, message);
+            let _ = std::io::stdout().flush();
+        };
+        let result = run_diarization(
+            app,
+            &meeting_id,
+            std::path::Path::new(&folder),
+            args.num_speakers,
+            args.max_speakers,
+            cancel,
+            &on_progress,
+        )
+        .await;
+        println!();
+        let result = result.map_err(|e| e.to_string())?;
+        println!("Diarization took {:.0}s", started.elapsed().as_secs_f64());
+        result
+    };
+
+    println!(
+        "✓ Speakers imported: {} of {} segments updated. meeting_id={}",
+        result.updated_segments, result.total_segments, meeting_id
+    );
+
+    // Per speaker breakdown, from what is now stored for the meeting (segments with
+    // broken timing, end before start, count as zero minutes)
+    let rows = sqlx::query_as::<_, (Option<String>, i64, f64)>(
+        "SELECT speaker, COUNT(*), COALESCE(SUM(MAX(audio_end_time - audio_start_time, 0.0)), 0.0)
+         FROM transcripts WHERE meeting_id = ? GROUP BY speaker ORDER BY 3 DESC",
+    )
+    .bind(&meeting_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("Failed to load speakers: {}", e))?;
+    for (speaker, segments, seconds) in rows {
+        let name = speaker
+            .as_deref()
+            .map(speaker_display_name)
+            .unwrap_or_else(|| "(none)".to_string());
+        println!("  {:<14} {:>4} segments  {:>6.1} min", name, segments, seconds / 60.0);
+    }
+
     Ok(())
 }
 
