@@ -685,7 +685,14 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    if let Err(e) = window.hide() {
+                    // A recording in progress always goes to the tray: quitting here would
+                    // cut it off without the stop flow that saves it.
+                    if !audio::recording_commands::is_recording_active()
+                        && !tray::close_to_tray_enabled(window.app_handle())
+                    {
+                        log::info!("Main window closed with close to tray turned off, quitting");
+                        window.app_handle().exit(0);
+                    } else if let Err(e) = window.hide() {
                         log::error!("Failed to hide main window on close request: {}", e);
                     } else {
                         log::info!("Main window hidden to tray on close request");
@@ -945,6 +952,9 @@ pub fn run() {
             audio::diarization::get_local_user_name_command,
             audio::diarization::get_diarization_settings_command,
             audio::diarization::set_diarization_hf_token_command,
+            // Main window close behaviour
+            tray::get_close_to_tray,
+            tray::set_close_to_tray,
             get_build_info,
         ])
         .build(tauri::generate_context!())
