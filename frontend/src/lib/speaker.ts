@@ -8,6 +8,9 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+/** Stored speaker value of the microphone channel (the local user) */
+export const MIC_SPEAKER = 'mic';
+
 const DIARIZATION_LABEL = /^SPEAKER_(\d+)$/;
 
 /** Human readable speaker name, or null when the segment has no speaker */
@@ -52,4 +55,57 @@ export function speakerColorIndex(speaker: string): number {
     hash = (hash * 31 + speaker.charCodeAt(i)) | 0;
   }
   return (Math.abs(hash) % 7) + 1;
+}
+
+const AUTOMATIC_LABEL = /^(mic|system|SPEAKER_\d+)$/;
+
+/** True for labels set by the app (microphone, system audio, diarization), false for a given name */
+export function isAutomaticSpeaker(speaker: string): boolean {
+  return AUTOMATIC_LABEL.test(speaker);
+}
+
+/** One speaker of a meeting (audio/speaker_names.rs SpeakerInfo) */
+export interface SpeakerInfo {
+  speaker: string;
+  label: string;
+  segments: number;
+  seconds: number;
+  sample: string | null;
+  named: boolean;
+}
+
+export interface SpeakerEvidenceLine {
+  time: number | null;
+  label: string | null;
+  text: string;
+}
+
+/** A name the LLM proposes for a speaker, with the transcript lines that show it */
+export interface SpeakerNameSuggestion {
+  speaker: string;
+  label: string;
+  name: string;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+  evidence: SpeakerEvidenceLine[];
+}
+
+export function getMeetingSpeakers(meetingId: string): Promise<SpeakerInfo[]> {
+  return invoke<SpeakerInfo[]>('get_meeting_speakers_command', { meetingId });
+}
+
+/** Renames every line of `speaker`; resolves to the number of lines changed */
+export function renameSpeaker(meetingId: string, speaker: string, name: string): Promise<number> {
+  return invoke<number>('rename_speaker_command', { meetingId, speaker, name });
+}
+
+export function suggestSpeakerNames(meetingId: string): Promise<SpeakerNameSuggestion[]> {
+  return invoke<SpeakerNameSuggestion[]>('suggest_speaker_names_command', { meetingId });
+}
+
+/** Error from a Tauri invoke as a readable message */
+export function invokeErrorMessage(err: unknown): string {
+  if (typeof err === 'string') return err;
+  if (err instanceof Error) return err.message;
+  return String(err);
 }

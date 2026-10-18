@@ -15,6 +15,7 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { formatSpeakerLabel } from '@/lib/speaker';
+import { SpeakerNamesPanel } from './SpeakerNamesPanel';
 
 interface DiarizationDialogProps {
   open: boolean;
@@ -276,7 +277,7 @@ export function DiarizationDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="sm:max-w-[450px]"
+        className="sm:max-w-[520px] max-h-[90vh] overflow-y-auto"
         onEscapeKeyDown={blockWhileProcessing}
         onInteractOutside={blockWhileProcessing}
       >
@@ -309,6 +310,10 @@ export function DiarizationDialog({
         </DialogHeader>
 
         <div className="space-y-4 py-4">
+          {!isProcessing && !error && (
+            <SpeakerNamesPanel meetingId={meetingId} onRenamed={onComplete} disabled={busy} />
+          )}
+
           {!isProcessing && !error && (
             <div className="space-y-3">
               <div className="flex items-center gap-2">

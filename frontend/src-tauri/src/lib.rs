@@ -952,6 +952,10 @@ pub fn run() {
             audio::diarization::get_local_user_name_command,
             audio::diarization::get_diarization_settings_command,
             audio::diarization::set_diarization_hf_token_command,
+            // Speaker names
+            audio::speaker_names::get_meeting_speakers_command,
+            audio::speaker_names::rename_speaker_command,
+            audio::speaker_names::suggest_speaker_names_command,
             // Main window close behaviour
             tray::get_close_to_tray,
             tray::set_close_to_tray,

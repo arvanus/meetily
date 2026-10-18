@@ -57,6 +57,9 @@ pub mod recovery;
 // Diarization import module (merge external speaker diarization into transcripts)
 pub mod diarization;
 
+// Speaker names: list, rename and LLM suggestions for a meeting's speakers
+pub mod speaker_names;
+
 pub use devices::{
     default_input_device, default_output_device, get_device_and_config, list_audio_devices,
     parse_audio_device, trigger_audio_permission,

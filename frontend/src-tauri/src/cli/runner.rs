@@ -1,4 +1,4 @@
-use crate::cli::args::{DiarizeArgs, RecordArgs, RetranscribeArgs, SummarizeArgs};
+use crate::cli::args::{DiarizeArgs, RecordArgs, RetranscribeArgs, SpeakersArgs, SummarizeArgs};
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
 use std::io::Write;
@@ -1561,6 +1561,87 @@ pub async fn run_summarize(app: &tauri::AppHandle, args: SummarizeArgs) -> Resul
     .await?;
 
     println!("✓ Summary saved. meeting_id={}", meeting_id);
+    Ok(())
+}
+
+/// Speakers of an existing meeting (`--meeting <id>` or `--last`): applies `--rename`,
+/// prints the speakers and, with `--suggest`, the names the summary LLM proposes.
+pub async fn run_speakers(app: &tauri::AppHandle, args: SpeakersArgs) -> Result<(), String> {
+    use crate::audio::speaker_names::{find_speaker, list_speakers, rename_speaker, suggest_speaker_names};
+    use crate::database::repositories::meeting::MeetingsRepository;
+
+    args.validate()?;
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    let meeting_id = if let Some(id) = args.meeting.clone() {
+        id
+    } else {
+        let meetings = MeetingsRepository::get_meetings(&pool)
+            .await
+            .map_err(|e| format!("Failed to list meetings: {}", e))?;
+        meetings
+            .first()
+            .map(|m| m.id.clone())
+            .ok_or_else(|| "No meetings found.".to_string())?
+    };
+
+    for value in &args.rename {
+        let (wanted, name) = SpeakersArgs::split_rename(value).expect("validated above");
+        let speakers = list_speakers(&pool, &meeting_id).await?;
+        let speaker = find_speaker(&speakers, wanted).ok_or_else(|| {
+            let labels: Vec<&str> = speakers.iter().map(|s| s.label.as_str()).collect();
+            format!("No speaker \"{}\" in this meeting. Speakers: {}", wanted, labels.join(", "))
+        })?;
+        let changed = rename_speaker(&pool, &meeting_id, &speaker.speaker, name).await?;
+        println!("✓ {} -> {} ({} lines)", speaker.label, name, changed);
+    }
+
+    let speakers = list_speakers(&pool, &meeting_id).await?;
+    if speakers.is_empty() {
+        println!("Meeting {} has no speaker labels; run `diarize` first.", meeting_id);
+        return Ok(());
+    }
+    println!("Speakers of meeting {}:", meeting_id);
+    for s in &speakers {
+        let stored = if s.label != s.speaker { format!(" ({})", s.speaker) } else { String::new() };
+        println!(
+            "  {:<24} {:>3}:{:02}  {:>4} lines  {}",
+            format!("{}{}", s.label, stored),
+            (s.seconds as u64) / 60,
+            (s.seconds as u64) % 60,
+            s.segments,
+            s.sample.as_deref().map(|t| format!("\"{}\"", t)).unwrap_or_default()
+        );
+    }
+
+    if args.suggest {
+        println!();
+        println!("Asking the summary LLM who the unnamed speakers are...");
+        let app_data_dir = app.path().app_data_dir().ok();
+        let suggestions = suggest_speaker_names(&pool, &meeting_id, app_data_dir.as_ref()).await?;
+        if suggestions.is_empty() {
+            println!("No speaker could be identified from the transcript.");
+        }
+        for s in &suggestions {
+            println!();
+            println!("  {} -> {}  [{}]", s.label, s.name, s.confidence);
+            if !s.reason.is_empty() {
+                println!("    {}", s.reason);
+            }
+            for e in &s.evidence {
+                let time = e
+                    .time
+                    .map(|t| format!("{:02}:{:02} ", (t as u64) / 60, (t as u64) % 60))
+                    .unwrap_or_default();
+                let who = e.label.as_deref().map(|l| format!("{}: ", l)).unwrap_or_default();
+                println!("    {}{}\"{}\"", time, who, e.text);
+            }
+        }
+        if !suggestions.is_empty() {
+            println!();
+            println!("Apply with: --rename \"<speaker>=<name>\"");
+        }
+    }
     Ok(())
 }
 

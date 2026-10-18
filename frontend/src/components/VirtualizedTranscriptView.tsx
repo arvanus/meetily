@@ -9,7 +9,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
-import { formatSpeakerLabel, speakerColorIndex } from "@/lib/speaker";
+import { formatSpeakerLabel, speakerColorIndex, MIC_SPEAKER } from "@/lib/speaker";
+import { SpeakerLabelRename } from "./SpeakerLabelRename";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -38,6 +39,9 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    /** Rename a speaker in the whole meeting; when set, speaker labels are clickable */
+    onRenameSpeaker?: (speaker: string, name: string) => Promise<void>;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -89,6 +93,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     showConfidence,
     isPartial,
     speaker,
+    onRenameSpeaker,
 }: {
     id: string;
     timestamp: number;
@@ -98,6 +103,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     showConfidence: boolean;
     isPartial?: boolean;
     speaker?: string;
+    onRenameSpeaker?: (speaker: string, name: string) => Promise<void>;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
     const speakerLabel = formatSpeakerLabel(speaker);
@@ -121,7 +127,16 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
-                    {speakerLabel && (
+                    {speakerLabel && speaker && onRenameSpeaker && speaker !== MIC_SPEAKER ? (
+                        <span className="block">
+                            <SpeakerLabelRename
+                                speaker={speaker}
+                                label={speakerLabel}
+                                className={speakerColor}
+                                onRename={onRenameSpeaker}
+                            />
+                        </span>
+                    ) : speakerLabel && (
                         <span className={`block text-xs font-semibold ${speakerColor}`}>
                             {speakerLabel}
                         </span>
@@ -156,6 +171,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onRenameSpeaker,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -330,6 +346,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         showConfidence={showConfidence}
                                         isPartial={segment.is_partial}
                                         speaker={segment.speaker}
+                                        onRenameSpeaker={onRenameSpeaker}
                                     />
                                 </div>
                             );
@@ -401,6 +418,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         showConfidence={showConfidence}
                                         isPartial={segment.is_partial}
                                         speaker={segment.speaker}
+                                        onRenameSpeaker={onRenameSpeaker}
                                     />
                                 </motion.div>
                             );

@@ -5,8 +5,10 @@ import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptVie
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { ContextAttachmentsBar } from './ContextAttachmentsBar';
 import type { ContextAttachment } from '@/hooks/meeting-details/useSummaryContext';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { toast } from 'sonner';
+import { renameSpeaker } from '@/lib/speaker';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -74,6 +76,14 @@ export function TranscriptPanel({
       speaker: t.speaker,
     }));
   }, [transcripts, usePagination, segments]);
+
+  // Renames a speaker in the whole meeting, then reloads the transcript
+  const handleRenameSpeaker = useCallback(async (speaker: string, name: string) => {
+    if (!meetingId) return;
+    const changed = await renameSpeaker(meetingId, speaker, name);
+    toast.success(`Speaker renamed to ${name.trim()}`, { description: `${changed} lines updated` });
+    await onRefetchTranscripts?.();
+  }, [meetingId, onRefetchTranscripts]);
 
   // Native (Tauri) drag-and-drop for adding attachments.
   const dropRef = useRef<HTMLDivElement>(null);
@@ -156,6 +166,7 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          onRenameSpeaker={meetingId && !isRecording ? handleRenameSpeaker : undefined}
         />
       </div>
 

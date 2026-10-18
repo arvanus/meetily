@@ -33,6 +33,10 @@ pub enum Command {
     /// speaker labels into the transcript. With --file, only imports a
     /// diarization.json / .rttm produced elsewhere.
     Diarize(DiarizeArgs),
+    /// List the speakers of a meeting, rename them, or ask the summary LLM for names.
+    ///
+    /// Suggestions are only printed; apply one with --rename.
+    Speakers(SpeakersArgs),
 }
 
 #[derive(clap::Args, Debug, Default, Clone)]
@@ -283,10 +287,65 @@ impl DiarizeArgs {
     }
 }
 
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct SpeakersArgs {
+    /// Meeting id (use `list-meetings` to discover ids)
+    #[arg(long)]
+    pub meeting: Option<String>,
+    /// Use the most recent meeting instead of passing an id
+    #[arg(long)]
+    pub last: bool,
+    /// Rename a speaker: "Speaker 3=Lucca" (the label as listed, or the stored value).
+    /// Repeat for several speakers. Giving two speakers the same name merges them.
+    #[arg(long, value_name = "SPEAKER=NAME")]
+    pub rename: Vec<String>,
+    /// Ask the summary LLM who the unnamed speakers are, with the lines that show it
+    #[arg(long)]
+    pub suggest: bool,
+}
+
+impl SpeakersArgs {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(bad) = self.rename.iter().find(|r| Self::split_rename(r).is_none()) {
+            return Err(format!("--rename expects SPEAKER=NAME, got \"{}\".", bad));
+        }
+        match (self.meeting.is_some(), self.last) {
+            (true, true) => Err("use either --meeting <id> or --last, not both.".to_string()),
+            (false, false) => Err("specify the meeting: --meeting <id> or --last.".to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// "Speaker 3=Lucca" -> ("Speaker 3", "Lucca")
+    pub fn split_rename(value: &str) -> Option<(&str, &str)> {
+        let (speaker, name) = value.split_once('=')?;
+        let (speaker, name) = (speaker.trim(), name.trim());
+        (!speaker.is_empty() && !name.is_empty()).then_some((speaker, name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn speakers_args_parse_renames() {
+        let cli = Cli::parse_from([
+            "meetily-cli", "speakers", "--last", "--rename", "Speaker 3=Lucca", "--rename", "SPEAKER_01 = Felipe",
+        ]);
+        let Some(Command::Speakers(args)) = cli.command else { panic!("expected Speakers") };
+        assert!(args.validate().is_ok());
+        assert_eq!(SpeakersArgs::split_rename(&args.rename[0]), Some(("Speaker 3", "Lucca")));
+        assert_eq!(SpeakersArgs::split_rename(&args.rename[1]), Some(("SPEAKER_01", "Felipe")));
+
+        let cli = Cli::parse_from(["meetily-cli", "speakers", "--last", "--rename", "Lucca"]);
+        let Some(Command::Speakers(args)) = cli.command else { panic!("expected Speakers") };
+        assert!(args.validate().is_err());
+        let cli = Cli::parse_from(["meetily-cli", "speakers", "--suggest"]);
+        let Some(Command::Speakers(args)) = cli.command else { panic!("expected Speakers") };
+        assert!(args.validate().is_err());
+    }
 
     #[test]
     fn diarize_requires_one_meeting_selector() {

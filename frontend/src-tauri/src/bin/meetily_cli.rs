@@ -94,6 +94,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Speakers(args) => {
+            if let Err(e) = tauri::async_runtime::block_on(runner::run_speakers(&handle, args)) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Record(args) => {
             if let Err(e) = tauri::async_runtime::block_on(runner::run_record(&handle, args)) {
                 eprintln!("error: {e}");
