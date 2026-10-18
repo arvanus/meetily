@@ -106,7 +106,9 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 8
+          # Same as the upstream workflows: pnpm-lock.yaml is lockfile v9, which pnpm 8
+          # ignores, resolving fresh npm versions that no longer match Cargo.lock
+          version: 9.15.9
           run_install: false
 
       - name: Setup Node
@@ -224,7 +226,7 @@ jobs:
       - name: Install frontend dependencies
         run: |
           cd frontend
-          pnpm install
+          pnpm install --frozen-lockfile
 
       - name: Build llama-helper sidecar (CPU-only)
         shell: pwsh
