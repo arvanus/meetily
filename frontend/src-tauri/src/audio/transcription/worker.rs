@@ -443,7 +443,7 @@ pub fn start_transcription_task<R: Runtime>(
 /// victim was the last thing said before the user stopped the recording,
 /// force-ended by the VAD flush - the "missing final block". The extra 100ms
 /// over the hard limit is margin against rounding in the resampler output.
-const MIN_TRANSCRIBE_SAMPLES: usize = 17600;
+pub(crate) const MIN_TRANSCRIBE_SAMPLES: usize = 17600;
 
 /// Segments shorter than this (300ms at 16kHz) are not padded: they are most
 /// likely noise blips, and stretching those into a full second of near-silence
@@ -452,7 +452,7 @@ const PAD_FLOOR_SAMPLES: usize = 4800;
 
 /// Pad a short speech segment with trailing silence so the engine can transcribe
 /// it. Returns whether padding was applied.
-fn pad_short_chunk(samples: &mut Vec<f32>) -> bool {
+pub(crate) fn pad_short_chunk(samples: &mut Vec<f32>) -> bool {
     if !(PAD_FLOOR_SAMPLES..MIN_TRANSCRIBE_SAMPLES).contains(&samples.len()) {
         return false;
     }

@@ -1,6 +1,7 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
 use crate::audio::decoder::decode_audio_file;
+use crate::audio::transcription::worker::{pad_short_chunk, MIN_TRANSCRIBE_SAMPLES};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
@@ -390,15 +391,26 @@ async fn run_retranscription<R: Runtime>(
                 continue;
             }
 
+            // Same sub-second padding as the live path: Whisper returns nothing below ~1s.
+            let mut samples = segment.samples.clone();
+            pad_short_chunk(&mut samples);
+
             let (text, conf) = if use_parakeet {
                 let engine = parakeet_engine.as_ref().unwrap();
-                let text = engine.transcribe_audio(segment.samples.clone()).await
+                let text = engine.transcribe_audio(samples).await
                     .map_err(|e| anyhow!("Transcription failed on segment {}: {}", i, e))?;
                 (text, 0.9f32)
             } else {
+                // Noise blips too short to pad would come back empty anyway; skip them
+                // instead of letting whisper.cpp log "input is too short" over the progress line.
+                if samples.len() < MIN_TRANSCRIBE_SAMPLES {
+                    debug!("{}Skipping {:.2}s segment {} (too short for Whisper)",
+                        channel_prefix, samples.len() as f64 / 16000.0, i + 1);
+                    continue;
+                }
                 let engine = whisper_engine.as_ref().unwrap();
                 let (text, conf, _) = engine
-                    .transcribe_audio_with_confidence(segment.samples.clone(), language.clone()).await
+                    .transcribe_audio_with_confidence(samples, language.clone()).await
                     .map_err(|e| anyhow!("Transcription failed on segment {}: {}", i, e))?;
                 (text, conf)
             };

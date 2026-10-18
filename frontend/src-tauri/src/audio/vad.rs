@@ -299,10 +299,13 @@ impl ContinuousVadProcessor {
     }
 
     fn process_chunk(&mut self, chunk: &[f32]) -> Result<()> {
-        // Track accumulated speech buffer size (throttled to one warning per ~5s of growth)
+        // Track accumulated speech buffer size (throttled to one message per ~5s of growth).
+        // Debug, not warn: long speech is expected and already handled by the adaptive
+        // redemption/force-split below; at warn level an offline pass over a long meeting
+        // (retranscription/import) printed dozens of these over the CLI progress line.
         let current_speech_size = self.current_speech.len();
         if self.should_emit_buffer_warning(current_speech_size) {
-            warn!("VAD: Accumulated speech buffer is large: {} samples ({:.1}s) - will split at next micro-pause",
+            debug!("VAD: Accumulated speech buffer is large: {} samples ({:.1}s) - will split at next micro-pause",
                   current_speech_size, current_speech_size as f64 / 16000.0);
         }
 

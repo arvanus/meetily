@@ -1,4 +1,4 @@
-use crate::cli::args::{DiarizeArgs, RecordArgs, RetranscribeArgs, SpeakersArgs, SummarizeArgs};
+use crate::cli::args::{DiarizeArgs, ListMeetingsArgs, RecordArgs, RetranscribeArgs, SpeakersArgs, SummarizeArgs};
 use crate::database::manager::DatabaseManager;
 use crate::state::AppState;
 use std::io::Write;
@@ -1079,25 +1079,76 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
 
 /// Lista as reuniões (id, data, título), mais recentes primeiro, para descobrir
 /// os ids usados em `summarize --meeting <id>`.
-pub async fn run_list_meetings(app: &tauri::AppHandle) -> Result<(), String> {
+pub async fn run_list_meetings(
+    app: &tauri::AppHandle,
+    args: ListMeetingsArgs,
+) -> Result<(), String> {
     use crate::database::repositories::meeting::MeetingsRepository;
+    use crate::database::repositories::tags::TagsRepository;
+    use std::collections::HashMap;
 
     let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    // A misspelled tag would otherwise look like "no meetings", so reject it up front
+    if !args.tags.is_empty() {
+        let known = TagsRepository::list_tags(&pool)
+            .await
+            .map_err(|e| format!("Failed to list tags: {}", e))?;
+        let unknown: Vec<&str> = args
+            .tags
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !known.iter().any(|k| k.name.eq_ignore_ascii_case(t)))
+            .collect();
+        if !unknown.is_empty() {
+            let available = if known.is_empty() {
+                "(none)".to_string()
+            } else {
+                known.iter().map(|k| k.name.as_str()).collect::<Vec<_>>().join(", ")
+            };
+            return Err(format!(
+                "Unknown tag(s): {}. Available tags: {}",
+                unknown.join(", "),
+                available
+            ));
+        }
+    }
+
     let meetings = MeetingsRepository::get_meetings(&pool)
         .await
         .map_err(|e| format!("Failed to list meetings: {}", e))?;
-
-    if meetings.is_empty() {
-        println!("(none)");
-        return Ok(());
+    let mut tags_by_meeting: HashMap<String, Vec<String>> = HashMap::new();
+    for link in TagsRepository::list_meeting_tag_links(&pool)
+        .await
+        .map_err(|e| format!("Failed to list meeting tags: {}", e))?
+    {
+        tags_by_meeting.entry(link.meeting_id).or_default().push(link.name);
     }
-    for m in meetings {
+
+    let mut printed = false;
+    // The repository returns newest first (what the app sidebar wants); in a terminal the
+    // newest should end up last, right above the prompt
+    for m in meetings.into_iter().rev() {
+        let tags = tags_by_meeting.get(&m.id).map(Vec::as_slice).unwrap_or(&[]);
+        if !args.matches(tags) {
+            continue;
+        }
+        printed = true;
+        let tags_suffix = if tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", tags.join(", "))
+        };
         println!(
-            "{}  {}  {}",
+            "{}  {}  {}{}",
             m.id,
-            m.created_at.0.format("%Y-%m-%d %H:%M"),
-            m.title
+            m.created_at.0.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
+            m.title,
+            tags_suffix
         );
+    }
+    if !printed {
+        println!("(none)");
     }
     Ok(())
 }

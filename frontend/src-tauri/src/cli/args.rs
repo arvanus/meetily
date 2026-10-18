@@ -18,8 +18,8 @@ pub enum Command {
     ListModels,
     /// List audio devices
     ListDevices,
-    /// List meetings (id, date, title) to discover meeting ids
-    ListMeetings,
+    /// List meetings (id, date, title, tags) to discover meeting ids
+    ListMeetings(ListMeetingsArgs),
     /// List available summary templates (id, name, description)
     ListTemplates,
     /// Re-transcribe an existing meeting's saved audio with another model
@@ -194,6 +194,34 @@ impl RecordArgs {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default, Clone)]
+pub struct ListMeetingsArgs {
+    /// Only meetings with this tag (case-insensitive). Repeat to require several tags
+    #[arg(long = "tag", value_name = "NAME")]
+    pub tags: Vec<String>,
+    /// With several --tag, match meetings having any of them instead of all
+    #[arg(long, requires = "tags")]
+    pub any_tag: bool,
+}
+
+impl ListMeetingsArgs {
+    /// Whether a meeting carrying `meeting_tags` passes the --tag filter.
+    pub fn matches<S: AsRef<str>>(&self, meeting_tags: &[S]) -> bool {
+        let has = |wanted: &String| {
+            meeting_tags
+                .iter()
+                .any(|t| t.as_ref().trim().eq_ignore_ascii_case(wanted.trim()))
+        };
+        if self.tags.is_empty() {
+            true
+        } else if self.any_tag {
+            self.tags.iter().any(has)
+        } else {
+            self.tags.iter().all(has)
+        }
     }
 }
 
@@ -568,6 +596,50 @@ mod tests {
         assert_eq!(args.meeting.as_deref(), Some("abc"));
         assert_eq!(args.model, "large-v3");
         assert!(args.summarize);
+    }
+
+    #[test]
+    fn list_meetings_without_tags_matches_everything() {
+        let cli = Cli::parse_from(["meetily-cli", "list-meetings"]);
+        let Some(Command::ListMeetings(args)) = cli.command else {
+            panic!("expected ListMeetings")
+        };
+        assert!(args.matches::<&str>(&[]));
+        assert!(args.matches(&["client"]));
+    }
+
+    #[test]
+    fn list_meetings_tags_require_all_by_default() {
+        let cli = Cli::parse_from(["meetily-cli", "list-meetings", "--tag", "Client", "--tag", "sales"]);
+        let Some(Command::ListMeetings(args)) = cli.command else {
+            panic!("expected ListMeetings")
+        };
+        assert!(args.matches(&["client", "Sales", "weekly"]));
+        assert!(!args.matches(&["client"]));
+        assert!(!args.matches::<&str>(&[]));
+    }
+
+    #[test]
+    fn list_meetings_any_tag_matches_one_of_them() {
+        let cli = Cli::parse_from([
+            "meetily-cli",
+            "list-meetings",
+            "--tag",
+            "client",
+            "--tag",
+            "sales",
+            "--any-tag",
+        ]);
+        let Some(Command::ListMeetings(args)) = cli.command else {
+            panic!("expected ListMeetings")
+        };
+        assert!(args.matches(&["sales"]));
+        assert!(!args.matches(&["weekly"]));
+    }
+
+    #[test]
+    fn list_meetings_any_tag_requires_tag() {
+        assert!(Cli::try_parse_from(["meetily-cli", "list-meetings", "--any-tag"]).is_err());
     }
 
     #[test]

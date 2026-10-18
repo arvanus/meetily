@@ -67,8 +67,8 @@ fn main() {
             tauri::async_runtime::block_on(runner::run_list_models(&handle))
                 .unwrap_or_else(|e| eprintln!("error: {e}"));
         }
-        Command::ListMeetings => {
-            tauri::async_runtime::block_on(runner::run_list_meetings(&handle))
+        Command::ListMeetings(args) => {
+            tauri::async_runtime::block_on(runner::run_list_meetings(&handle, args))
                 .unwrap_or_else(|e| eprintln!("error: {e}"));
         }
         Command::ListTemplates => {
