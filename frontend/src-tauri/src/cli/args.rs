@@ -102,6 +102,23 @@ pub struct RecordArgs {
     /// With --summarize, leave the meeting tags alone (overrides the app setting)
     #[arg(long)]
     pub no_auto_tag: bool,
+    /// After saving (and re-transcribing), identify who spoke in this meeting, like the
+    /// `diarize` command, before naming the speakers and summarizing
+    #[arg(long)]
+    pub diarize: bool,
+    /// With --diarize: exact number of speakers (see `diarize --num-speakers`)
+    #[arg(long, conflicts_with = "max_speakers")]
+    pub num_speakers: Option<u32>,
+    /// With --diarize: upper bound on the number of speakers (see `diarize --max-speakers`)
+    #[arg(long)]
+    pub max_speakers: Option<u32>,
+    /// Ask the summary LLM who the speakers are and confirm each name in the terminal
+    /// before the summary
+    #[arg(long)]
+    pub name_speakers: bool,
+    /// Like --name-speakers, but names with "high" confidence are applied without asking
+    #[arg(long)]
+    pub name_speakers_auto: bool,
 }
 
 /// `--auto-tag` / `--no-auto-tag` as an override of the app setting; `None` keeps the setting.
@@ -158,6 +175,21 @@ impl RecordArgs {
         if self.summarize && self.record_only && self.retranscribe_model.is_none() {
             return Err(
                 "--summarize needs a transcription; with --record-only, add --retranscribe-model <model>."
+                    .to_string(),
+            );
+        }
+        if (self.num_speakers.is_some() || self.max_speakers.is_some()) && !self.diarize {
+            return Err("--num-speakers/--max-speakers require --diarize.".to_string());
+        }
+        if self.diarize && self.no_audio_save {
+            return Err("--diarize reads the saved audio file; remove --no-audio-save.".to_string());
+        }
+        if (self.diarize || self.name_speakers || self.name_speakers_auto)
+            && self.record_only
+            && self.retranscribe_model.is_none()
+        {
+            return Err(
+                "--diarize/--name-speakers need a transcription; with --record-only, add --retranscribe-model <model>."
                     .to_string(),
             );
         }
@@ -302,6 +334,10 @@ pub struct SpeakersArgs {
     /// Ask the summary LLM who the unnamed speakers are, with the lines that show it
     #[arg(long)]
     pub suggest: bool,
+    /// Like --suggest, but apply the "high" confidence names the transcript backs; the
+    /// others are asked in the terminal (only printed without one)
+    #[arg(long)]
+    pub auto: bool,
 }
 
 impl SpeakersArgs {
@@ -487,6 +523,24 @@ mod tests {
         ]);
         let Some(Command::Record(args)) = cli.command else { panic!("expected Record") };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn record_diarize_and_name_flags_are_validated() {
+        let record = |extra: &[&str]| {
+            let args = [&["meetily-cli", "record"], extra].concat();
+            match Cli::try_parse_from(args).map(|cli| cli.command) {
+                Ok(Some(Command::Record(args))) => args.validate().is_ok(),
+                _ => false,
+            }
+        };
+        assert!(record(&["--diarize", "--max-speakers", "6", "--name-speakers-auto", "--summarize"]));
+        assert!(record(&["--name-speakers"]));
+        assert!(record(&["--record-only", "--retranscribe-model", "large-v3-turbo", "--diarize"]));
+        assert!(!record(&["--max-speakers", "6"]), "speaker counts need --diarize");
+        assert!(!record(&["--diarize", "--num-speakers", "2", "--max-speakers", "3"]));
+        assert!(!record(&["--diarize", "--no-audio-save"]), "diarization reads the audio file");
+        assert!(!record(&["--record-only", "--name-speakers-auto"]), "no transcript to name");
     }
 
     #[test]

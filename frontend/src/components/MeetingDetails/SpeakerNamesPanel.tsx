@@ -207,6 +207,14 @@ export function SpeakerNamesPanel({ meetingId, onRenamed, disabled }: SpeakerNam
                 <span className={`text-[11px] ml-1 ${CONFIDENCE_STYLE[suggestion.confidence] ?? ''}`}>
                   ({suggestion.confidence})
                 </span>
+                {!suggestion.verified && (
+                  <span
+                    className="text-[11px] ml-1 text-red-700"
+                    title="The name is not said in these lines, or none of them is said by this speaker"
+                  >
+                    · no proof in the transcript
+                  </span>
+                )}
               </div>
               {suggestion.reason && <p className="text-xs text-muted-foreground mt-1">{suggestion.reason}</p>}
               <div className="mt-1 space-y-0.5 border-l-2 border-gray-200 pl-2">

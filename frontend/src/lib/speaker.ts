@@ -87,6 +87,8 @@ export interface SpeakerNameSuggestion {
   name: string;
   confidence: 'high' | 'medium' | 'low';
   reason: string;
+  /** False when the lines do not show the name said and the speaker talking */
+  verified: boolean;
   evidence: SpeakerEvidenceLine[];
 }
 

@@ -6,9 +6,10 @@
 // The diarization label it replaces ("SPEAKER_02") is gone afterwards, and running
 // diarization or a retranscription again replaces the names.
 //
-// LLM suggestions are never applied here. Each one must point at transcript lines
-// where the name (or a close spelling of it) is actually said, one of them by that
-// speaker; anything else is dropped before it reaches the user.
+// LLM suggestions are never applied here. Each one is checked against the transcript
+// lines it cites: the name (or a close spelling of it) must be said in one of them and
+// one of them must be said by that speaker. Suggestions that fail are kept but marked
+// unverified, so a person decides on them; automatic naming applies only verified ones.
 
 use crate::audio::diarization::{local_user_name, speaker_summary_label, MIC_SPEAKER, SYSTEM_SPEAKER};
 use crate::database::repositories::setting::SettingsRepository;
@@ -72,6 +73,9 @@ pub struct SpeakerNameSuggestion {
     /// "high", "medium" or "low"
     pub confidence: String,
     pub reason: String,
+    /// False when the cited lines do not show the name and the speaker; only a person
+    /// should apply it
+    pub verified: bool,
     pub evidence: Vec<EvidenceLine>,
 }
 
@@ -557,11 +561,18 @@ pub fn name_is_spoken(name: &str, text: &str) -> bool {
         })
 }
 
-/// Keeps the suggestions the transcript backs up: a known unnamed speaker, a valid
-/// name, evidence lines that exist, the name said in at least one of them and at least
-/// one of them said by that speaker.
-/// Several replies (one per chunk) are merged: per speaker, the name with the most
-/// evidence wins and disagreement lowers the confidence.
+/// The transcript backs a name when one of the cited lines says it and one of them is
+/// said by the speaker (introducing themselves, or answering when named)
+fn is_backed(name: &str, evidence: &[usize], speaker: &str, lines: &[TranscriptLine]) -> bool {
+    evidence.iter().any(|id| name_is_spoken(name, &lines[*id].text))
+        && evidence.iter().any(|id| lines[*id].speaker.as_deref() == Some(speaker))
+}
+
+/// Checks LLM suggestions against the transcript. Dropped: speakers that are not unnamed
+/// targets, invalid names and line ids that do not exist. Kept with `verified: false`:
+/// names the cited lines do not back, which only a person should apply.
+/// Several replies (one per chunk) are merged: per speaker, a backed name beats unbacked
+/// ones, then the name with the most evidence wins and disagreement lowers the confidence.
 pub fn validate_suggestions(
     raw: &[RawSuggestion],
     targets: &[&SpeakerInfo],
@@ -587,13 +598,6 @@ pub fn validate_suggestions(
             .copied()
             .filter(|id| *id < lines.len() && seen.insert(*id))
             .collect();
-        if !evidence.iter().any(|id| name_is_spoken(&name, &lines[*id].text)) {
-            continue;
-        }
-        // The speaker must say one of the lines: introducing themselves, or answering when named
-        if !evidence.iter().any(|id| lines[*id].speaker.as_deref() == Some(target.speaker.as_str())) {
-            continue;
-        }
 
         let entry = grouped
             .entry(target.speaker.clone())
@@ -617,17 +621,27 @@ pub fn validate_suggestions(
     let mut suggestions = Vec::new();
     for target in targets {
         let Some(candidates) = grouped.remove(&target.speaker) else { continue };
-        let mut candidates: Vec<_> = candidates.into_values().collect();
-        candidates.sort_by(|a, b| {
+        let mut candidates: Vec<_> = candidates
+            .into_values()
+            .map(|c| {
+                let verified = is_backed(&c.0, &c.3, &target.speaker, lines);
+                (c, verified)
+            })
+            .collect();
+        // Names without proof do not count as disagreement with one the transcript backs
+        if candidates.iter().any(|(_, verified)| *verified) {
+            candidates.retain(|(_, verified)| *verified);
+        }
+        candidates.sort_by(|(a, _), (b, _)| {
             b.3.len()
                 .cmp(&a.3.len())
                 .then(confidence_rank(&b.1).cmp(&confidence_rank(&a.1)))
         });
-        let (name, mut confidence, reasons, mut evidence) = candidates[0].clone();
+        let ((name, mut confidence, reasons, mut evidence), verified) = candidates[0].clone();
         let mut reason = reasons.join(" ");
         if candidates.len() > 1 {
             confidence = "low".to_string();
-            let others = candidates[1..].iter().map(|c| c.0.as_str()).collect::<Vec<_>>().join(", ");
+            let others = candidates[1..].iter().map(|(c, _)| c.0.as_str()).collect::<Vec<_>>().join(", ");
             reason = format!("{} Other candidates: {}.", reason, others).trim().to_string();
         }
         evidence.sort_unstable();
@@ -638,6 +652,7 @@ pub fn validate_suggestions(
             name,
             confidence,
             reason,
+            verified,
             evidence: evidence
                 .into_iter()
                 .map(|id| EvidenceLine {
@@ -754,10 +769,11 @@ pub(crate) async fn suggest_speaker_names(
 
     let suggestions = validate_suggestions(&raw, &targets, &lines);
     info!(
-        "Speaker name suggestions for meeting {}: {} from the LLM, {} backed by the transcript",
+        "Speaker name suggestions for meeting {}: {} from the LLM, {} kept, {} backed by the transcript",
         meeting_id,
         raw.len(),
-        suggestions.len()
+        suggestions.len(),
+        suggestions.iter().filter(|s| s.verified).count()
     );
     Ok(suggestions)
 }
@@ -853,17 +869,19 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_need_a_line_by_the_named_speaker() {
+    fn suggestions_without_a_line_by_the_named_speaker_are_unverified() {
         let lines = sample_lines();
         let speakers = summarize_speakers(&lines);
         let targets: Vec<&SpeakerInfo> = speakers.iter().filter(|s| s.speaker != "mic").collect();
         // Line 1 is Speaker 3 saying "Eu, Luca": it proves nothing about Speaker 2
         let suggestions = validate_suggestions(&[raw("Speaker 2", "Lucca", "high", &[1])], &targets, &lines);
-        assert!(suggestions.is_empty());
+        assert_eq!(suggestions.len(), 1, "kept for a person to decide");
+        assert!(!suggestions[0].verified);
+        assert_eq!(suggestions[0].confidence, "high");
     }
 
     #[test]
-    fn suggestions_need_the_name_in_existing_evidence() {
+    fn suggestions_are_verified_by_the_name_in_existing_evidence() {
         let lines = sample_lines();
         let speakers = summarize_speakers(&lines);
         let targets: Vec<&SpeakerInfo> = speakers.iter().filter(|s| s.speaker != "mic").collect();
@@ -873,7 +891,7 @@ mod tests {
                 raw("Speaker 3", "Lucca", "medium", &[1]),
                 // Felipe is said on line 2 (by mic) and answered on line 3
                 raw("Speaker 2", "Felipe", "high", &[2, 3, 99]),
-                // Diego is never said: dropped
+                // Diego is never said: unverified, so it loses to Lucca without a conflict
                 raw("Speaker 3", "Diego", "high", &[1]),
                 // unknown speaker and the mic are not targets
                 raw("Speaker 9", "Ana", "high", &[0]),
@@ -889,9 +907,27 @@ mod tests {
         assert_eq!(felipe.confidence, "high");
         assert_eq!(felipe.evidence.len(), 2, "line ids outside the transcript are dropped");
         assert_eq!(felipe.evidence[0].text, "Felipe, e o teu lado?");
+        assert!(felipe.verified);
         let lucca = suggestions.iter().find(|s| s.speaker == "SPEAKER_02").unwrap();
         assert_eq!(lucca.name, "Lucca");
-        assert_eq!(lucca.confidence, "medium", "Diego was dropped, so there is no conflict");
+        assert!(lucca.verified);
+        assert_eq!(lucca.confidence, "medium", "unverified Diego is not a conflict");
+    }
+
+    #[test]
+    fn unverified_names_still_conflict_with_each_other() {
+        let lines = sample_lines();
+        let speakers = summarize_speakers(&lines);
+        let targets: Vec<&SpeakerInfo> = speakers.iter().filter(|s| s.speaker != "mic").collect();
+        let suggestions = validate_suggestions(
+            &[raw("Speaker 2", "Bruno", "high", &[3, 4]), raw("Speaker 2", "Carla", "high", &[3])],
+            &targets,
+            &lines,
+        );
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].name, "Bruno", "more evidence wins");
+        assert!(!suggestions[0].verified);
+        assert_eq!(suggestions[0].confidence, "low");
     }
 
     #[test]

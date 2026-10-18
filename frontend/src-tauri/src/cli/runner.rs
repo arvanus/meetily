@@ -1032,6 +1032,26 @@ pub async fn run_record(app: &tauri::AppHandle, args: RecordArgs) -> Result<(), 
         .await?;
     }
 
+    // record --diarize / --name-speakers[-auto]: speakers of THIS meeting (not --last),
+    // before the summary so it already uses the names. Failures are warnings only: the
+    // recording is saved and the summary still runs.
+    if args.diarize {
+        let diarize = DiarizeArgs {
+            meeting: Some(meeting_id.to_string()),
+            num_speakers: args.num_speakers,
+            max_speakers: args.max_speakers,
+            ..Default::default()
+        };
+        if let Err(e) = run_diarize(app, diarize).await {
+            eprintln!("Warning: --diarize failed (the recording was saved): {}", e);
+        }
+    }
+    if args.name_speakers || args.name_speakers_auto {
+        if let Err(e) = name_speakers(app, meeting_id, args.name_speakers_auto).await {
+            eprintln!("Warning: naming the speakers failed (the recording was saved): {}", e);
+        }
+    }
+
     // record --summarize: chains the summary of the meeting just recorded. validate()
     // guarantees there is a transcript to work with: either the live one, or the one
     // --retranscribe-model produced above (the only way --record-only gets here).
@@ -1614,6 +1634,18 @@ pub async fn run_speakers(app: &tauri::AppHandle, args: SpeakersArgs) -> Result<
         );
     }
 
+    if args.auto {
+        println!();
+        name_speakers(app, &meeting_id, true).await?;
+        println!();
+        println!("Speakers now:");
+        for s in list_speakers(&pool, &meeting_id).await? {
+            let stored = if s.label != s.speaker { format!(" ({})", s.speaker) } else { String::new() };
+            println!("  {:<24} {:>4} lines", format!("{}{}", s.label, stored), s.segments);
+        }
+        return Ok(());
+    }
+
     if args.suggest {
         println!();
         println!("Asking the summary LLM who the unnamed speakers are...");
@@ -1623,23 +1655,94 @@ pub async fn run_speakers(app: &tauri::AppHandle, args: SpeakersArgs) -> Result<
             println!("No speaker could be identified from the transcript.");
         }
         for s in &suggestions {
-            println!();
-            println!("  {} -> {}  [{}]", s.label, s.name, s.confidence);
-            if !s.reason.is_empty() {
-                println!("    {}", s.reason);
-            }
-            for e in &s.evidence {
-                let time = e
-                    .time
-                    .map(|t| format!("{:02}:{:02} ", (t as u64) / 60, (t as u64) % 60))
-                    .unwrap_or_default();
-                let who = e.label.as_deref().map(|l| format!("{}: ", l)).unwrap_or_default();
-                println!("    {}{}\"{}\"", time, who, e.text);
-            }
+            print_suggestion(s);
         }
         if !suggestions.is_empty() {
             println!();
             println!("Apply with: --rename \"<speaker>=<name>\"");
+        }
+    }
+    Ok(())
+}
+
+/// One LLM name suggestion with the transcript lines that back it
+fn print_suggestion(s: &crate::audio::speaker_names::SpeakerNameSuggestion) {
+    println!();
+    let proof = if s.verified { "" } else { ", no proof in these lines" };
+    println!("  {} -> {}  [{}{}]", s.label, s.name, s.confidence, proof);
+    if !s.reason.is_empty() {
+        println!("    {}", s.reason);
+    }
+    for e in &s.evidence {
+        let time = e
+            .time
+            .map(|t| format!("{:02}:{:02} ", (t as u64) / 60, (t as u64) % 60))
+            .unwrap_or_default();
+        let who = e.label.as_deref().map(|l| format!("{}: ", l)).unwrap_or_default();
+        println!("    {}{}\"{}\"", time, who, e.text);
+    }
+}
+
+/// Answer to "Apply? [y/N/other name]": the suggested name, a typed name, or None to skip
+fn parse_name_answer(answer: &str, suggested: &str) -> Option<String> {
+    match answer.trim() {
+        "" => None,
+        a if ["n", "no", "nao", "não"].contains(&a.to_lowercase().as_str()) => None,
+        a if ["y", "yes", "s", "sim"].contains(&a.to_lowercase().as_str()) => Some(suggested.to_string()),
+        a => Some(a.to_string()),
+    }
+}
+
+/// record --name-speakers[-auto] and speakers --auto: asks the summary LLM who the
+/// speakers of the meeting are and renames the ones the user confirms. With `auto_high`,
+/// "high" confidence names the transcript backs are applied without asking. Without a
+/// terminal nothing is asked, so only those change.
+async fn name_speakers(app: &tauri::AppHandle, meeting_id: &str, auto_high: bool) -> Result<(), String> {
+    use crate::audio::speaker_names::{rename_speaker, suggest_speaker_names};
+    use std::io::IsTerminal;
+
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+    println!("Asking the summary LLM who the speakers are...");
+    let app_data_dir = app.path().app_data_dir().ok();
+    let suggestions = suggest_speaker_names(&pool, meeting_id, app_data_dir.as_ref()).await?;
+    if suggestions.is_empty() {
+        println!("No speaker could be identified from the transcript.");
+    }
+    let interactive = std::io::stdin().is_terminal();
+
+    for s in &suggestions {
+        print_suggestion(s);
+        let auto = auto_high && s.verified && s.confidence == "high";
+        let name = if auto {
+            Some(s.name.clone())
+        } else if interactive {
+            print!("    Apply? [y/N/other name]: ");
+            let _ = std::io::stdout().flush();
+            let answer = tokio::task::spawn_blocking(|| {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).map(|_| line)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("Failed to read the answer: {}", e))?;
+            parse_name_answer(&answer, &s.name)
+        } else {
+            None
+        };
+        let Some(name) = name else {
+            println!("    skipped");
+            continue;
+        };
+        // A bad typed name (brackets, a reserved label) skips this speaker, not the rest
+        match rename_speaker(&pool, meeting_id, &s.speaker, &name).await {
+            Ok(changed) => println!(
+                "    ✓ {} -> {} ({} lines{})",
+                s.label,
+                name,
+                changed,
+                if auto { ", auto" } else { "" }
+            ),
+            Err(e) => eprintln!("    {}", e),
         }
     }
     Ok(())
@@ -1774,4 +1877,18 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_name_answer;
+
+    #[test]
+    fn name_answers_apply_skip_or_rename() {
+        assert_eq!(parse_name_answer("y\r\n", "Fernando"), Some("Fernando".to_string()));
+        assert_eq!(parse_name_answer("Sim", "Fernando"), Some("Fernando".to_string()));
+        assert_eq!(parse_name_answer("\n", "Fernando"), None, "Enter skips");
+        assert_eq!(parse_name_answer("não", "Fernando"), None);
+        assert_eq!(parse_name_answer(" Fernanda Lima \n", "Fernando"), Some("Fernanda Lima".to_string()));
+    }
 }
