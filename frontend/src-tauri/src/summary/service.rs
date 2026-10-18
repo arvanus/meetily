@@ -940,6 +940,7 @@ mod tests {
                 item_format: None,
                 example_item_format: None,
             }],
+            context: None,
         }
     }
 

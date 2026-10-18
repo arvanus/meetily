@@ -79,6 +79,12 @@ fn should_retry_chunk_failure(
 const ENGLISH_BASE_SUMMARY_INSTRUCTION: &str =
     "**Write the summary/report in English regardless of transcript language; non-English prose is invalid.**";
 
+/// People's names must come from the transcript, and speaker diarization labels stay as
+/// they are unless the transcript itself says who is speaking. Without this, models filled
+/// "Participants" from the template context (a list of usual names) and labelled an
+/// unnamed "Speaker 3" with a name nobody said in the meeting.
+const SPEAKER_NAME_INSTRUCTION: &str = "Only name a person if that name (or an obvious mis-transcription of it) is spoken in the transcript. Labels like \"Speaker 2\" come from automatic speaker detection: keep them as they are unless the transcript explicitly identifies that speaker (someone addresses them by name, or they introduce themselves). Never guess a name for a speaker.";
+
 fn resolve_cached_english<'a>(
     cached: Option<&'a str>,
     summary_language: Option<&str>,
@@ -217,13 +223,13 @@ fn translation_system_prompt(target_language: &str) -> String {
 
 fn build_chunk_summary_user_prompt(chunk: &str) -> String {
     format!(
-        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals. Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
+        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals. {SPEAKER_NAME_INSTRUCTION} Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
     )
 }
 
 fn build_combine_summary_user_prompt(combined_text: &str) -> String {
     format!(
-        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nThe following are consecutive summaries of a meeting. Combine them into a single, coherent, and detailed narrative summary that retains all important details, organized logically. Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<summaries>\n{combined_text}\n</summaries>"
+        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nThe following are consecutive summaries of a meeting. Combine them into a single, coherent, and detailed narrative summary that retains all important details, organized logically. Keep speaker labels like \"Speaker 2\" exactly as they appear; do not turn them into names. Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<summaries>\n{combined_text}\n</summaries>"
     )
 }
 fn build_final_report_system_prompt(
@@ -231,10 +237,16 @@ fn build_final_report_system_prompt(
     clean_template_markdown: &str,
     template_context: Option<&str>,
 ) -> String {
-    // Optional context block from the template (Template.context)
+    // Optional context block from the template (Template.context). It is reference
+    // material (usual names, projects): never evidence of who attended or what was said.
     let context_block = match template_context {
         Some(ctx) if !ctx.is_empty() => {
-            format!("\n**ADDITIONAL CONTEXT (provided by user):**\n{ctx}\n")
+            format!(
+                "\n**ADDITIONAL CONTEXT (provided by user, reference only):**\n\
+                 Use it to correct names and terms that were mis-transcribed and to relate topics \
+                 to known projects. It does not tell who attended the meeting or what was said.\n\
+                 {ctx}\n"
+            )
         }
         _ => String::new(),
     };
@@ -251,6 +263,8 @@ fn build_final_report_system_prompt(
 6. Output **only** the completed Markdown report.
 7. Do not include reasoning, thinking, self-correction, decision strategy, or any meta-commentary sections — output only the completed Markdown report.
 8. If unsure about something, omit it.
+9. {SPEAKER_NAME_INSTRUCTION}
+10. Lists of participants or attendees include only people who speak or are said to be present in the transcript; an unnamed speaker stays as its "Speaker N" label.
 {context_block}
 **SECTION-SPECIFIC INSTRUCTIONS:**
 {section_instructions}
@@ -712,6 +726,17 @@ mod tests {
 
         assert!(prompt.contains(ENGLISH_BASE_SUMMARY_INSTRUCTION));
         assert!(prompt.contains("SECTION-SPECIFIC INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn prompts_forbid_guessing_speaker_names() {
+        let final_prompt = build_final_report_system_prompt("Fill", "# Title", Some("Usual names: Ana, Bruno"));
+        assert!(final_prompt.contains(SPEAKER_NAME_INSTRUCTION));
+        assert!(final_prompt.contains("reference only"));
+        assert!(final_prompt.contains("does not tell who attended"));
+        assert!(final_prompt.contains("Usual names: Ana, Bruno"));
+        assert!(build_chunk_summary_user_prompt("x").contains(SPEAKER_NAME_INSTRUCTION));
+        assert!(build_combine_summary_user_prompt("x").contains("Keep speaker labels"));
     }
 
     #[test]
