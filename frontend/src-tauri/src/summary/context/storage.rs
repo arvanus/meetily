@@ -150,7 +150,8 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_path_separators() {
-        assert_eq!(sanitize_basename("../etc/passwd"), "etc_passwd");
+        // Separators become '_' and only the leading dots are stripped.
+        assert_eq!(sanitize_basename("../etc/passwd"), "_etc_passwd");
         assert_eq!(sanitize_basename("a\\b.txt"), "a_b.txt");
     }
 

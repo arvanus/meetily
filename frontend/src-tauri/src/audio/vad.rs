@@ -853,8 +853,11 @@ mod tests {
         p.in_speech = true;
         p.speech_start_sample = 0;
 
-        feed_speech_chunks(&mut p, 31 * 16000 / 480);
+        // Run past the force-split so the pending tail is in `current_speech`: these tests
+        // bypass silero, so its own speech buffer is empty and flush() could not use it.
+        feed_speech_chunks(&mut p, 61 * 16000 / 480);
         assert!(p.aggressive_redemption_active, "precondition: aggressive redemption engaged");
+        assert!(p.force_split_occurred, "precondition: force-split happened");
 
         let finals = p.flush().unwrap();
         assert!(!finals.is_empty(), "flush must emit the pending speech");
@@ -981,8 +984,10 @@ mod tests {
         let segments = processor
             .process_audio(&audio)
             .expect("process_audio failed");
+        // Partial (in-progress) segments carry a negative confidence; only a final one
+        // would mean the utterance already ended.
         assert!(
-            segments.is_empty(),
+            segments.iter().all(|s| s.confidence < 0.0),
             "process_audio completed a segment, so flush() would not exercise force-end"
         );
         assert!(
@@ -990,7 +995,12 @@ mod tests {
             "expected to still be mid-speech before flush()"
         );
 
-        let flushed = processor.flush().expect("flush failed");
+        let flushed: Vec<SpeechSegment> = processor
+            .flush()
+            .expect("flush failed")
+            .into_iter()
+            .filter(|s| s.confidence >= 0.0)
+            .collect();
         assert_eq!(
             flushed.len(),
             1,
