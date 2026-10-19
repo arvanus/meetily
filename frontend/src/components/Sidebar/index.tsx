@@ -630,7 +630,7 @@ const Sidebar: React.FC = () => {
               )}
             </>
           ) : (
-            <div className="flex flex-col w-full">
+            <div className="flex flex-col w-full min-w-0">
               <div className="flex items-center w-full">
                 {isMeetingItem ? (
                   <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-gray-100">
@@ -641,7 +641,8 @@ const Sidebar: React.FC = () => {
                     <Plus className="w-3.5 h-3.5 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">{item.title}</span>
+                {/* min-w-0: flex items default to min-content width, so a long unbroken word would push the action buttons out */}
+                <span className="flex-1 min-w-0 break-words">{item.title}</span>
                 {meetingDate && (
                   <span className={`ml-2 shrink-0 text-xs tabular-nums ${isActive ? 'text-blue-500' : 'text-gray-400'}`}>
                     {format(meetingDate, 'HH:mm')}
