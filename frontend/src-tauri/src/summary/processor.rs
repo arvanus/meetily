@@ -48,6 +48,26 @@ pub fn clean_llm_markdown_detailed(raw: &str) -> CleanedLlmMarkdown {
     }
 }
 
+/// Last JSON object in `text` that has `key`, read as `T`. A model that corrects itself
+/// writes several of them; the last one is its answer. None when there is none, or when
+/// the last one does not have the expected shape (an earlier answer may have been retracted).
+pub fn last_json_object_with<T: serde::de::DeserializeOwned>(text: &str, key: &str) -> Option<T> {
+    let mut last = None;
+    let mut pos = 0;
+    while let Some(offset) = text[pos..].find('{') {
+        let start = pos + offset;
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(value)) if value.get(key).is_some() => {
+                last = Some(value);
+                pos = start + stream.byte_offset();
+            }
+            _ => pos = start + 1,
+        }
+    }
+    last.and_then(|value| serde_json::from_value(value).ok())
+}
+
 pub(crate) fn contains_reasoning_marker(markdown: &str) -> bool {
     THINK_MARKER_REGEX.is_match(markdown)
 }
