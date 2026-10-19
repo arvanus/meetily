@@ -17,7 +17,7 @@ use crate::ollama::metadata::ModelMetadataCache;
 use crate::state::AppState;
 use crate::summary::context::repository::SummaryContextRepository;
 use crate::summary::llm_client::{generate_summary, LLMProvider};
-use crate::summary::processor::clean_llm_markdown_detailed;
+use crate::summary::processor::{clean_llm_markdown_detailed, last_json_object_with};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -469,31 +469,12 @@ fn normalize_confidence(value: Option<&str>) -> String {
     }
 }
 
-/// Last `{"speakers": ...}` object in `text`. None when there is none, or when the last
-/// one does not have the expected shape (an earlier answer may have been retracted).
-fn last_reply_object(text: &str) -> Option<SuggestionReply> {
-    let mut last = None;
-    let mut pos = 0;
-    while let Some(offset) = text[pos..].find('{') {
-        let start = pos + offset;
-        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
-        match stream.next() {
-            Some(Ok(value)) if value.get("speakers").is_some() => {
-                last = Some(serde_json::from_value::<SuggestionReply>(value).ok());
-                pos = start + stream.byte_offset();
-            }
-            _ => pos = start + 1,
-        }
-    }
-    last.flatten()
-}
-
 /// Reads `{"speakers": [...]}` out of an LLM reply (thinking blocks, fences and prose
 /// around it are ignored). A model that corrects itself writes several of them; the
 /// last one is its answer. None when nothing parses.
 pub fn parse_suggestion_reply(response: &str) -> Option<Vec<RawSuggestion>> {
     let cleaned = clean_llm_markdown_detailed(response).markdown;
-    let reply = last_reply_object(&cleaned)?;
+    let reply: SuggestionReply = last_json_object_with(&cleaned, "speakers")?;
     Some(
         reply
             .speakers

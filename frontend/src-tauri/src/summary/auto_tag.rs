@@ -7,7 +7,7 @@
 use crate::database::models::TagModel;
 use crate::database::repositories::tags::TagsRepository;
 use crate::summary::llm_client::{generate_summary, LLMProvider};
-use crate::summary::processor::clean_llm_markdown_detailed;
+use crate::summary::processor::{clean_llm_markdown_detailed, last_json_object_with};
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -82,15 +82,16 @@ fn outer_span(text: &str, open: char, close: char) -> Option<&str> {
 }
 
 /// Reads the tag names out of the LLM reply. Accepts `{"tags": [...]}` surrounded by
-/// thinking blocks, code fences or prose, and a bare JSON array when the reply has no
-/// object at all. Returns `None` when nothing parses.
+/// thinking blocks, code fences or prose (the last one wins when the model corrects
+/// itself), and a bare JSON array when the reply has no object at all. Returns `None`
+/// when nothing parses.
 pub fn parse_tag_names(response: &str) -> Option<Vec<String>> {
     let cleaned = clean_llm_markdown_detailed(response).markdown;
 
     // An object under any other shape (e.g. {"not_applicable": [...]}) must not be
     // mistaken for a tag list, so only a reply without one falls back to a bare array
-    if let Some(object) = outer_span(&cleaned, '{', '}') {
-        return serde_json::from_str::<TagsReply>(object).ok().map(|reply| reply.tags);
+    if outer_span(&cleaned, '{', '}').is_some() {
+        return last_json_object_with::<TagsReply>(&cleaned, "tags").map(|reply| reply.tags);
     }
 
     outer_span(&cleaned, '[', ']').and_then(|array| serde_json::from_str::<Vec<String>>(array).ok())
@@ -226,6 +227,24 @@ mod tests {
     fn parses_json_after_thinking_block() {
         let reply = "<think>The meeting is about {payments}</think>\n{\"tags\": [\"Payzli\"]}";
         assert_eq!(parse_tag_names(reply), Some(names(&["Payzli"])));
+    }
+
+    #[test]
+    fn keeps_the_last_answer_when_the_model_corrects_itself() {
+        let reply = "{\"tags\": [\"Payzli\"]}\nOn second thought:\n```json\n{\"tags\": [\"Internal\"]}\n```";
+        assert_eq!(parse_tag_names(reply), Some(names(&["Internal"])));
+
+        let reply = "{\"tags\": [\"Payzli\"]}\nWait, nothing applies.\n{\"tags\": []}";
+        assert_eq!(parse_tag_names(reply), Some(vec![]));
+
+        // A malformed last answer is not overridden by an earlier, retracted one
+        assert_eq!(parse_tag_names(r#"{"tags": ["Payzli"]} {"tags": "Internal"}"#), None);
+    }
+
+    #[test]
+    fn ignores_stray_braces_in_prose() {
+        let reply = r#"I considered {Payzli}, but the answer is {"tags": ["Follow-up"]} as {requested}."#;
+        assert_eq!(parse_tag_names(reply), Some(names(&["Follow-up"])));
     }
 
     #[test]
